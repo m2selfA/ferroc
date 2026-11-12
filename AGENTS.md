@@ -17,6 +17,8 @@ ferroc = Ferrum + Commander，Better Remote Commander 的原生 Rust 重写预�
 - `cargo test --locked --all-features --all-targets`。
 - 显式原生/SDK 探针、图标和来源审计命令见 `docs/verification/windows-gui-preview.md`。
 - Node 只用于可选上游/SDK 对照测试，不是程序运行时依赖。
+- CI 只允许 tag push 触发；仅 Windows/Linux x86_64，Linux须通过 glibc 2.17 ABI和真实容器门禁；见 `docs/releasing.md`。
+- CI 验证器：`python -B -m unittest discover -s scripts/tests -v`；不得仅凭目标后缀宣称 glibc 兼容。
 
 ## 必须保留的边界
 - WindUI 必须使用发布 registry crate，不改 Git 依赖、patch 或全局依赖缓存。

@@ -115,11 +115,17 @@ node scripts/upstream-e2e.mjs ../better-remote-commander ./target/release/ferroc
 
 上游对照须位于固定提交 `cbe511702dd0147650353c29ac6ab1decd8afda1`，先按其 lockfile 构建 shared/relay。测试临时监听 loopback，执行后关闭。报告在 `artifacts/`，不含 token/password。
 
-本机 Windows 代理支持基线构建通过 54 项默认 Rust 测试及单独执行的原版 Node 双向密码互操作测试；同一 release 二进制通过原生 relay + agent 回环，以及原版 relay 的 7 组互操作 + 14 项 OAuth/MCP 检查。99 MB 验证仅为本地密码回环，不是公网传输。原生基线见 [历史报告](docs/verification/windows-native-preview.md)，加密协议见 [历史传输报告](docs/verification/windows-transfer-preview.md)，默认开启策略见 [历史默认策略报告](docs/verification/windows-transfer-defaults.md)，图标来源与历史构建见 [图标报告](docs/verification/windows-bright-icon.md)，当前代理、Windows 资源与同一二进制回归见 [当前报告](docs/verification/windows-agent-proxy.md)；**不等于**公网 TLS、Claude/ChatGPT 实际连接或 Linux/macOS 已验证。CI 配置覆盖三平台，但尚未在 GitHub 执行。
+本机 Windows 代理支持基线构建通过 54 项默认 Rust 测试及单独执行的原版 Node 双向密码互操作测试；同一 release 二进制通过原生 relay + agent 回环，以及原版 relay 的 7 组互操作 + 14 项 OAuth/MCP 检查。99 MB 验证仅为本地密码回环，不是公网传输。原生基线见 [历史报告](docs/verification/windows-native-preview.md)，加密协议见 [历史传输报告](docs/verification/windows-transfer-preview.md)，默认开启策略见 [历史默认策略报告](docs/verification/windows-transfer-defaults.md)，图标来源与历史构建见 [图标报告](docs/verification/windows-bright-icon.md)，当前代理、Windows 资源与同一二进制回归见 [当前报告](docs/verification/windows-agent-proxy.md)；**不等于**公网 TLS、Claude/ChatGPT 实际连接或 Linux/macOS 已验证。CI 仅由 tag push 触发，当前仅构建 Windows/Linux x86_64；Linux 设有 glibc 2.17 的 ABI 与实际运行门禁。首次 tag 构建完成前，不把配置和本机测试视为 GitHub 构建成功。
 
 工程测试与独立签收分开：当前本地验证已通过；advisor 两次观测失配，未取得有效的独立审阅认可。完整分歧和后续阻塞见当前报告，不能称为安全审计或生产资格。
 
 GUI 增量另通过 62 项全 feature 回归、显式原生窗口和 HTTP MCP SDK 测试；其二进制哈希、真实托盘交互缺口和独立复核超时见 [GUI 验证记录](docs/verification/windows-gui-preview.md)。提交代码不代表发布或完整验收。
+
+## Tag 构建与下载
+
+常规提交和 PR **不触发 CI**；仅 push tag 构建 Windows x86_64（CLI + GUI）和 Linux x86_64（CLI，glibc 2.17 兼容门禁）。两平台检查通过后生成带 `SHA256SUMS` 的 GitHub 预览 Release；不产出 macOS/ARM/musl 版。
+
+版本 tag 由操作员显式创建，不会随提交自动生成。触发方法、固定工具版本、glibc ABI/真实容器验证及尚待首次 tag 执行的边界见 [发布说明](docs/releasing.md)。
 
 ## 溯源
 

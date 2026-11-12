@@ -1,17 +1,157 @@
-name: Rust
-on: [push, pull_request]
+name: Tag release
+
+# No branch push, pull_request, schedule or manual trigger.
+'on':
+  push:
+    tags: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tag-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: '1'
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  windows:
+    if: ${{ !github.event.deleted }}
+    runs-on: windows-2022
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
-      - run: cargo build --locked --release
+      - name: Check and test
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'fmt failed' }
+          cargo clippy --locked --all-features --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'clippy failed' }
+          cargo test --locked --all-features --all-targets
+          if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
+          python -B -m unittest discover -s scripts/tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'CI verifier tests failed' }
+      - name: Build CLI and GUI, verify resources, package
+        shell: pwsh
+        run: |
+          cargo build --locked --release --features gui --bins
+          if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $stage = Join-Path $env:RUNNER_TEMP 'ferroc-windows-x86_64'
+          New-Item -ItemType Directory -Path "$stage/docs/licenses" | Out-Null
+          foreach ($name in @('ferroc', 'ferroc-gui')) {
+            & ./scripts/verify-windows-resources.ps1 -Exe "target/release/$name.exe" | Set-Content "$stage/$name-resources.json"
+            Copy-Item "target/release/$name.exe" $stage
+          }
+          & ./target/release/ferroc.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'CLI startup failed' }
+          Copy-Item LICENSE,NOTICE,SECURITY.md $stage
+          "ferroc preview: CLI ferroc.exe; Windows GUI ferroc-gui.exe. Full documentation: https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_SHA/README.md" | Set-Content "$stage/README.txt"
+          Copy-Item docs/licenses/windui-LICENSE-MIT "$stage/docs/licenses"
+          @{
+            commit = (git rev-parse HEAD); tag = $env:GITHUB_REF_NAME
+            target = 'x86_64-pc-windows-msvc'; rustc = (rustc --version)
+            binaries = @{
+              'ferroc.exe' = (Get-FileHash "$stage/ferroc.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+              'ferroc-gui.exe' = (Get-FileHash "$stage/ferroc-gui.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            status = 'preview; real GUI mouse/copy-path and independent review not certified by CI'
+          } | ConvertTo-Json -Depth 4 | Set-Content "$stage/BUILD-INFO.json"
+          Compress-Archive -Path $stage -DestinationPath dist/ferroc-windows-x86_64.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ferroc-windows-x86_64
+          path: dist/ferroc-windows-x86_64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  linux:
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-gnu
+      - name: Check and test on build host
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-features --all-targets -- -D warnings
+          cargo test --locked --all-features --all-targets
+          python3 -B -m unittest discover -s scripts/tests -v
+      - name: Install pinned cross-linker tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ferroc-build-tools"
+          "$RUNNER_TEMP/ferroc-build-tools/bin/python" -m pip install --disable-pip-version-check 'cargo-zigbuild==0.24.1' 'ziglang==0.14.1'
+          echo "$RUNNER_TEMP/ferroc-build-tools/bin" >> "$GITHUB_PATH"
+          zig_path=$("$RUNNER_TEMP/ferroc-build-tools/bin/python" -c 'import pathlib,ziglang; print(pathlib.Path(ziglang.__file__).parent / "zig")')
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$zig_path" >> "$GITHUB_ENV"
+          "$zig_path" version
+      - name: Build glibc 2.17 target and verify actual runtime
+        run: |
+          cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.17 --bin ferroc
+          python3 -B scripts/verify-linux-compat.py --binary target/x86_64-unknown-linux-gnu/release/ferroc --report artifacts/linux-compat.json
+      - name: Package verified Linux CLI
+        run: |
+          stage=dist/ferroc-linux-x86_64-glibc2.17
+          mkdir -p "$stage"
+          cp target/x86_64-unknown-linux-gnu/release/ferroc "$stage/ferroc"
+          cp LICENSE NOTICE SECURITY.md "$stage/"
+          cp artifacts/linux-compat.json "$stage/linux-compat.json"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          p = pathlib.Path('dist/ferroc-linux-x86_64-glibc2.17')
+          info = {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'tag': os.environ['GITHUB_REF_NAME'], 'target': 'x86_64-unknown-linux-gnu.2.17', 'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(), 'zigbuild': '0.24.1', 'zig': '0.14.1', 'binarySha256': hashlib.sha256((p/'ferroc').read_bytes()).hexdigest()}
+          (p/'BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n', encoding='utf-8')
+          (p/'README.txt').write_text('ferroc CLI preview. Documentation: https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/blob/' + info['commit'] + '/README.md\n', encoding='utf-8')
+          PY
+          tar -C dist -czf dist/ferroc-linux-x86_64-glibc2.17.tar.gz ferroc-linux-x86_64-glibc2.17
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ferroc-linux-x86_64-glibc2.17
+          path: dist/ferroc-linux-x86_64-glibc2.17.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ferroc-*
+          merge-multiple: true
+          path: dist
+          digest-mismatch: error
+      - name: Publish preview only after both platforms pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          test -s ferroc-windows-x86_64.zip
+          test -s ferroc-linux-x86_64-glibc2.17.tar.gz
+          sha256sum ferroc-windows-x86_64.zip ferroc-linux-x86_64-glibc2.17.tar.gz > SHA256SUMS
+          printf '%s\n' 'Automated ferroc preview, not full BRC parity or independent security certification.' 'Windows: CLI and GUI. Linux: CLI, GLIBC <= 2.17 ABI check and real 2.17 userspace MCP write/read gate.' 'GUI mouse/tray/copy-path acceptance and legacy Linux kernel/production qualification are not implied.' > "$RUNNER_TEMP/ferroc-release-notes.md"
+          gh release create "$TAG" ./*.zip ./*.tar.gz SHA256SUMS --verify-tag --draft --prerelease --title "ferroc $TAG (preview)" --notes-file "$RUNNER_TEMP/ferroc-release-notes.md"
+          gh release edit "$TAG" --draft=false

@@ -21,7 +21,7 @@ README's 24-tool count is stale; dispatcher has 27 handlers. ferroc advertises 2
 | prepare_file_transfer / send_file_transfer / receive_file_transfer | Native BRCX1 (X25519 SPKI, HKDF-SHA256, AES-256-GCM), enabled by default; --no-transfers disables them, --allow-transfers remains compatible. Fixed tmpfiles.org HTTPS; no redirects; one active transfer, 128 receive keys, 99 MB plaintext. Independent original-Node bidirectional fixtures verified; actual public-provider upload/download unverified and not attempted. |
 | Rust relay/SQLite/OAuth/PKCE/DCR/dashboard/audit | Implemented preview: single-admin server-rendered UI, manual approval, pause/resume/rename/delete, OAuth client deletion and bounded metadata audit. Native temporary DB roundtrip verified; no Node DB/token migration or multi-user/tenant parity. |
 | Packaging | Cargo binary, Windows PE metadata and Agnes bright 7-size icon, shared transparent PNGs and existing browser favicon; optional Windows GUI/tray preview; no autostart/Docker/Scoop package/release signing |
-| Platforms | Windows locally tested. Unix implementation and three-OS CI configuration exist but Linux/macOS execution unverified |
+| Platforms | Windows locally tested. Tag-only CI packages Windows x86_64 CLI+GUI and Linux x86_64 CLI; Linux must pass ELF GLIBC<=2.17 and real manylinux2014 MCP roundtrip gates. First tag execution remains pending; no macOS artifact or legacy-kernel qualification |
 
 ## Registered tools (25)
 
