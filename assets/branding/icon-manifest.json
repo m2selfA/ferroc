@@ -1,0 +1,87 @@
+{
+  "pngSizes": [
+    16,
+    20,
+    24,
+    32,
+    40,
+    48,
+    64,
+    128,
+    256,
+    512
+  ],
+  "masterDimensions": [
+    1024,
+    1024
+  ],
+  "sourceDimensions": [
+    1024,
+    1024
+  ],
+  "operation": "edge-connected near-white alpha cleanup then high-quality bicubic resize; no new artwork synthesized",
+  "whiteThreshold": 245,
+  "removedMattePixels": 316391,
+  "source": "assets/branding/ferroc-agnes-original.png",
+  "visibleFraction": 0.6982660293579102,
+  "icoSizes": [
+    16,
+    24,
+    32,
+    48,
+    64,
+    128,
+    256
+  ],
+  "outputs": [
+    {
+      "path": "assets/ferroc.png",
+      "sha256": "65fcb92328afff4ecff602a62f74fd70dd43ef28518b6066c2274a97a21dbe68"
+    },
+    {
+      "path": "assets/ferroc.ico",
+      "sha256": "ed48485a9844375533f0efc0a1caee77f778daf99d4b7f0d865603ad8d0372f3"
+    },
+    {
+      "path": "assets/icons/16.png",
+      "sha256": "4b620063c0264ac55a0131088ff7cab85e0693ca8f6114e8e72af44491b21106"
+    },
+    {
+      "path": "assets/icons/20.png",
+      "sha256": "604bdf0e145db2a249fd08297eb17a01a90ea440b772b36372cba7caf3c6828d"
+    },
+    {
+      "path": "assets/icons/24.png",
+      "sha256": "3d5e129c426f7d8e9e000a6ab45389e7238be9ff7b3a24694afa5cbe9ff8e1a9"
+    },
+    {
+      "path": "assets/icons/32.png",
+      "sha256": "00ad8e92e5ee382ea76ed9fca98304b63f34dc94b8ce599c2007f8e0ec85a2a3"
+    },
+    {
+      "path": "assets/icons/40.png",
+      "sha256": "8c1a4f2a725b75c88f8e9314b71ff9ca2712e374b08bff583853180065e8b8aa"
+    },
+    {
+      "path": "assets/icons/48.png",
+      "sha256": "d19476afefb4f78b3297511da8ec5cf9a795cf00627bb84faf1987dbe7c70af7"
+    },
+    {
+      "path": "assets/icons/64.png",
+      "sha256": "b81a087b42fcb96407bd7803d95ec997e92f7e068f7cf9dd6f11dc10fef26db3"
+    },
+    {
+      "path": "assets/icons/128.png",
+      "sha256": "9cf2b973d4ad659dad9068c05efe5a8199ec4d8237cfc023ff03a5b456d957ba"
+    },
+    {
+      "path": "assets/icons/256.png",
+      "sha256": "877206e327bb68b8e05a54eaffe8ea156dea3fb959a35b4a050a60003a60ae42"
+    },
+    {
+      "path": "assets/icons/512.png",
+      "sha256": "0c05cd9143e6d5276b61b0c74d479fac1f820810300afe910e5e285fb621ef44"
+    }
+  ],
+  "sourceSha256": "34640d50d729f38bb53c9911709ee603cfc96993f7898136c13ed29877d43ac2"
+}

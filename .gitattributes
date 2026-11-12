@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.ico binary
+*.png binary
+
+# Verbatim pinned upstream evidence: retain original whitespace and verify blob identity.
+docs/upstream/*.ts -whitespace

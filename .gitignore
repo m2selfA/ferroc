@@ -1,0 +1,10 @@
+/target
+/artifacts/
+/*.log
+/device.json
+*.sqlite*
+
+# Local agent planning and investigation notes (keep on disk, never commit).
+/findings.md
+/progress.md
+/task_plan.md

@@ -1,0 +1,19 @@
+ferroc — Ferrum + Commander
+===========================
+
+Independent Rust agent/core reimplementation based on the public protocol and
+behavioral contracts of Better Remote Commander:
+https://github.com/shahidx0x/better-remote-commander
+Pinned source: cbe511702dd0147650353c29ac6ab1decd8afda1
+Copyright (c) 2026 Better Remote Commander contributors (MIT).
+
+BRC's tool core is derived from Desktop Commander MCP:
+https://github.com/wonderwhy-er/DesktopCommanderMCP
+Copyright (c) 2024-2025 Eduard Ruzga and Desktop Commander Contributors (MIT).
+
+Reference snapshots in docs/upstream/ were obtained with GitHub MCP at the pinned
+revision. They are source evidence, not executed or shipped as a Node runtime.
+The original TypeScript repository remains separate from the Rust implementation.
+
+The optional Node script scripts/upstream-e2e.mjs is a test driver using a separate
+canonical relay checkout; ferroc itself is native Rust and has no Node runtime.

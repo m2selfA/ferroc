@@ -1,0 +1,22 @@
+{
+  "endpoint": "https://apihub.agnes-ai.com/v1/images/generations",
+  "requestedModel": "agnes-image-2.1-flash",
+  "providerCreatedNotLocalClock": true,
+  "rawResponseArtifact": "artifacts/agnes-icon-response.json",
+  "taskId": "task_46EQiUvcHd2fTkswF1dYl4BgNDosvoB4",
+  "prompt": "assets/branding/ferroc-agnes-prompt.txt",
+  "sourceSha256": "34640d50d729f38bb53c9911709ee603cfc96993f7898136c13ed29877d43ac2",
+  "conversionScript": "assets/generate-icons.ps1",
+  "originalSize": [
+    1024,
+    1024
+  ],
+  "providerCreated": 1794445997,
+  "artwork": "Bright iron-orange F monogram with turquoise command chevron on ivory tile; transparent exterior derived locally",
+  "promptSha256": "8de89972f2fcc16a497b540c48727e6bbe910eaef9a9312618413c3d19abe0bb",
+  "provider": "Agnes AI",
+  "reportedModel": null,
+  "sourceImage": "assets/branding/ferroc-agnes-original.png",
+  "sourceUrlWithoutQuery": "https://platform-outputs.agnes-ai.space/images/t2i/task_46EQiUvcHd2fTkswF1dYl4BgNDosvoB4/output_20822e79f2e4403480f1733d5cf7beff.png",
+  "reportedModelNote": "Provider response did not return a model field; requested model is not independently reported model evidence"
+}
