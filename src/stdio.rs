@@ -35,7 +35,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Mcp {
     initialized: bool,
 }

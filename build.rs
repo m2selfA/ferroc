@@ -6,7 +6,7 @@ fn main() {
         res.set_icon("assets/ferroc.ico")
             .set("ProductName", "ferroc")
             .set("FileDescription", "ferroc - Ferrum + Commander")
-            .set("OriginalFilename", "ferroc.exe");
+            .set("InternalName", "ferroc");
         res.compile()
             .expect("Windows SDK resource compiler required");
     }

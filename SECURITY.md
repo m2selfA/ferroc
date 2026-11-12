@@ -3,10 +3,18 @@
 ## Trust boundary
 
 - Only control computers you own or are authorized to administer.
-- Agent listens on no network port; it connects outbound to a trusted native ferroc or existing BRC relay. The optional relay command is a separately selected role of the same binary, not a mandatory additional service.
+- CLI `agent` listens on no network port; it connects outbound to a trusted native ferroc or existing BRC relay. The optional Windows GUI explicitly adds an authenticated loopback-only HTTP MCP listener. The optional relay command is a separately selected role of the same binary, not a mandatory additional service.
 - HTTPS required except loopback HTTP. Relay URL credentials/query/fragment are rejected. Pairing HTTP does not follow redirects.
 - No telemetry, no persistent argument/output logs. History stores tool name/time/error only, bounded to 1000 entries. Process command strings remain in in-memory sessions and can be returned by list_sessions.
 - Separate ~/.ferroc credentials: ACL restricted on Windows before writing secrets; Unix mode 0600. Existing credentials never overwritten. Revocation stops the agent; explicit pairing in another --home is required. No silent automatic re-pairing.
+
+## Windows GUI HTTP MCP preview
+
+- Uses published WindUI 0.32.0 and an in-process listener on an explicit loopback address only. Not an additional relay, public OAuth endpoint, or Windows service. CLI stdio remains separate.
+- 256-bit random bearer per start, exact Host and optional Origin, duplicate security header rejection, negotiated per-session protocol versions. Credentials appear only on explicit Copy MCP configuration; clipboard is an OS/user trust boundary, not a secret vault. Stop/restart invalidates old tokens and sessions.
+- JSON Streamable HTTP, not SSE: GET returns405. Sessions expire after30 minutes, maximum64; maximum4 admitted operations and16 body readers,5-second body deadline,1MiB message limit. Limits are preview controls, not production load qualification.
+- Pause/close prevent new admission; already admitted operations can complete and mutate state even after client disconnect or session DELETE. Exit waits for those operations before Runtime shutdown; no rollback/exactly-once/hard cancellation claim.
+- Resident host drives status/exit independently of window painting. Closing/minimizing destroys the replaceable UI window, not the controller; global input state persists on reopening. Native fixture verifies queued tooltip effects, not actual Shell tooltip text readback or end-user mouse behavior.
 
 ## Agent outbound proxies
 

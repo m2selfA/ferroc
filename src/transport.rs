@@ -168,11 +168,32 @@ pub async fn load_credentials(path: &Path) -> Result<Option<Credentials>> {
 pub async fn pair(input: &str, name: &str, path: &Path) -> Result<Credentials> {
     pair_with_network(input, name, path, &crate::network::Network::default()).await
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentEvent {
+    Pairing {
+        verification_uri: String,
+        user_code: String,
+    },
+    Connecting,
+    Connected,
+    Reconnecting {
+        delay_seconds: u64,
+    },
+}
 pub async fn pair_with_network(
     input: &str,
     name: &str,
     path: &Path,
     network: &crate::network::Network,
+) -> Result<Credentials> {
+    pair_with_network_observed(input, name, path, network, &|_| {}).await
+}
+pub async fn pair_with_network_observed(
+    input: &str,
+    name: &str,
+    path: &Path,
+    network: &crate::network::Network,
+    observe: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<Credentials> {
     let base = relay_url(input)?
         .to_string()
@@ -200,6 +221,14 @@ pub async fn pair_with_network(
     eprintln!("Pair device: {uri}\nCode: {user_code}");
     let expires = start["expires_in"].as_u64().context("missing expires_in")?;
     ensure!((1..=3600).contains(&expires), "invalid pairing expiry");
+    observe(AgentEvent::Pairing {
+        verification_uri: uri.chars().filter(|c| !c.is_control()).take(512).collect(),
+        user_code: user_code
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect(),
+    });
     let deadline = Instant::now() + Duration::from_secs(expires);
     let mut interval = start["interval"].as_u64().unwrap_or(5).clamp(2, 60);
     let device_id = uuid::Uuid::new_v4().to_string();
@@ -253,17 +282,24 @@ pub fn hello(creds: &Credentials) -> Value {
         "agentVersion":env!("CARGO_PKG_VERSION"),"coreVersion":concat!("ferroc-",env!("CARGO_PKG_VERSION"))},"tools":tools()})
 }
 
-async fn session(runtime: Arc<Runtime>, creds: &Credentials) -> Result<bool> {
+async fn session(
+    runtime: Arc<Runtime>,
+    creds: &Credentials,
+    observe: &(dyn Fn(AgentEvent) + Send + Sync),
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool> {
+    if *stop.borrow() {
+        return Ok(true);
+    }
     let url = websocket_url(&creds.relay_url)?;
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
-    let Some(mut ws) = runtime
-        .policy
-        .network
-        .websocket(url, &creds.device_token, config)
-        .await?
-    else {
+    let connection = tokio::select! {
+        result = runtime.policy.network.websocket(url, &creds.device_token, config) => result?,
+        _ = stop.changed() => return Ok(true),
+    };
+    let Some(mut ws) = connection else {
         return Ok(false);
     };
     timeout(
@@ -278,6 +314,12 @@ async fn session(runtime: Arc<Runtime>, creds: &Credentials) -> Result<bool> {
     let mut deadline = Instant::now() + Duration::from_secs(15);
     loop {
         tokio::select! {
+            _=stop.changed()=>{
+                drop(rx); // Do not strand result senders while draining admitted calls.
+                while let Some(result) = calls.join_next().await { result?; }
+                let _=timeout(Duration::from_secs(2),ws.close(None)).await;
+                return Ok(true);
+            },
             _=tokio::time::sleep_until(deadline)=>bail!("relay heartbeat/welcome timeout"),
             result=calls.join_next(),if !calls.is_empty()=>{result.context("call task missing")??;},
             Some(value)=rx.recv()=>{
@@ -295,7 +337,7 @@ async fn session(runtime: Arc<Runtime>, creds: &Credentials) -> Result<bool> {
                     _=>bail!("unexpected non-text relay frame"),
                 };
                 match msg {
-                    RelayMessage::Welcome {protocol}=>{ensure!(!welcomed && protocol==VERSION,"invalid relay protocol/welcome");welcomed=true;deadline=Instant::now()+Duration::from_secs(45);},
+                    RelayMessage::Welcome {protocol}=>{ensure!(!welcomed && protocol==VERSION,"invalid relay protocol/welcome");welcomed=true;observe(AgentEvent::Connected);deadline=Instant::now()+Duration::from_secs(45);},
                     RelayMessage::Ping {ts}=>{
                         ensure!(welcomed,"ping before welcome");deadline=Instant::now()+Duration::from_secs(45);
                         timeout(Duration::from_secs(5),ws.send(Message::Text(json!({"type":"pong","ts":ts}).to_string().into()))).await??;
@@ -321,23 +363,45 @@ async fn session(runtime: Arc<Runtime>, creds: &Credentials) -> Result<bool> {
     }
 }
 pub async fn run(runtime: Arc<Runtime>, creds: &Credentials, once: bool) -> Result<()> {
+    let (_keepalive, stop) = tokio::sync::watch::channel(false);
+    run_observed_until(runtime, creds, once, &|_| {}, stop).await
+}
+pub async fn run_observed_until(
+    runtime: Arc<Runtime>,
+    creds: &Credentials,
+    once: bool,
+    observe: &(dyn Fn(AgentEvent) + Send + Sync),
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let mut backoff = 1;
     loop {
         let started = Instant::now();
-        match session(runtime.clone(), creds).await {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        observe(AgentEvent::Connecting);
+        match session(runtime.clone(), creds, observe, stop.clone()).await {
             Ok(false) => bail!(
                 "relay rejected/revoked credentials or sent fatal error; no automatic re-pairing; use a new --home and explicitly pair"
             ),
             Ok(true) => return Ok(()),
             Err(e) if once => return Err(e),
-            Err(e) => eprintln!("relay connection lost: {e}; reconnecting in {backoff}s"),
+            Err(e) => {
+                observe(AgentEvent::Reconnecting {
+                    delay_seconds: backoff,
+                });
+                eprintln!("relay connection lost: {e}; reconnecting in {backoff}s");
+            }
         }
         // Do not leave a shell mutation running and then advertise a fresh connection/session.
         runtime.processes.shutdown().await;
         if started.elapsed() > Duration::from_secs(60) {
             backoff = 1;
         }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(backoff)) => {},
+            _ = stop.changed() => return Ok(()),
+        }
         backoff = (backoff * 2).min(30);
     }
 }

@@ -1,5 +1,7 @@
 pub mod config;
 pub mod files;
+pub mod gui_service;
+pub mod http_mcp;
 pub mod icons;
 pub mod network;
 pub mod process;

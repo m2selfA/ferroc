@@ -119,6 +119,10 @@ impl Runtime {
             _ => bail!("unknown or not implemented tool: {tool}"),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn test_fs_gate(&self) -> Arc<Mutex<()>> {
+        self.fs_gate.clone()
+    }
     pub async fn shutdown(&self) {
         self.transfers.shutdown();
         self.searches.shutdown();

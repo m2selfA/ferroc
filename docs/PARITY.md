@@ -44,7 +44,7 @@ Pinned upstream dispatcher has 27 handlers. Status is semantic parity, not name 
 | Native OAuth DCR / PKCE / code / refresh / revoke / metadata | Native release roundtrip incl. invalid verifier/token, code replay, refresh replay and revocation; external SaaS integration pending |
 | Native remote MCP endpoint and multi-device routing | JSON POST endpoint, 25 agent handlers + relay list_devices; 22 core successes, transfer prepare success and send/receive invalid-input routes verified. Positive transfer provider IO is source-profile fixture evidence. Multi-device conflict/reconnect has static implementation, not live-verified |
 | Native browser admin / login / pair approval / device pause/rename/delete / audit / client revoke | Implemented server-rendered single-admin UI; HTTP form flow + Origin/CSRF failures tested. No interactive browser visual QA or multi-user parity |
-| Shared Agnes bright icon | Windows PE7 payload/group mappings and file-icon extraction verified; existing browser favicon HTTP bytes/HTML links verified; native GUI/window/taskbar/tray lifecycle absent, reusable assets only |
+| Shared Agnes bright icon | Windows PE7 payload/group mappings and file-icon extraction verified; existing browser favicon HTTP bytes/HTML links verified; optional Windows GUI uses the same embedded/window/tray assets; native resident minimize/reopen/exit fixture and release PE7 mapping verified. Actual Shell tooltip mouse/copy-path acceptance pending; see [GUI verification](verification/windows-gui-preview.md) |
 | Service install/uninstall | pending |
 | Linux/macOS native execution | CI configured, not executed locally |
 

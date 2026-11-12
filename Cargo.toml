@@ -2,8 +2,18 @@
 name = "ferroc"
 version = "0.1.0"
 edition = "2024"
+default-run = "ferroc"
 description = "Ferrum + Commander: native Rust remote computer tools"
 license = "MIT"
+
+[features]
+default = []
+gui = ["dep:windui"]
+
+[[bin]]
+name = "ferroc-gui"
+path = "src/bin/ferroc-gui.rs"
+required-features = ["gui"]
 
 [dependencies]
 anyhow = "1"
@@ -36,6 +46,10 @@ aes = { version = "0.8", features = ["zeroize"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Published registry crate only; Cargo.lock checksum anchors the dependency bytes.
+windui = { version = "=0.32.0", default-features = false, optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

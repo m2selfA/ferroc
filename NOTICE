@@ -15,5 +15,15 @@ Reference snapshots in docs/upstream/ were obtained with GitHub MCP at the pinne
 revision. They are source evidence, not executed or shipped as a Node runtime.
 The original TypeScript repository remains separate from the Rust implementation.
 
-The optional Node script scripts/upstream-e2e.mjs is a test driver using a separate
-canonical relay checkout; ferroc itself is native Rust and has no Node runtime.
+The optional Node scripts scripts/upstream-e2e.mjs and
+scripts/gui-http-sdk-probe.mjs are test drivers using a separate canonical relay
+checkout/MCP SDK; ferroc itself is native Rust and has no Node runtime.
+
+The optional Windows GUI uses published WindUI 0.32.0:
+https://github.com/huanfeng/wind-ui-rust
+Copyright (c) 2026 huanfeng. Licensed under MIT OR Apache-2.0; the MIT
+license option and notice are retained at docs/licenses/windui-LICENSE-MIT.
+Registry package SHA-256:
+464c6095750e6d24823007f877d63eaab32594e83dea4fca4d49c6331ca54fe5
+Published package VCS: 78a088c90bcf8d8367bb97f347814aef2994ccb2.
+This is a registry dependency, not a Git-source build or local patch.
