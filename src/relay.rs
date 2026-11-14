@@ -130,6 +130,17 @@ impl Relay {
         }))
     }
     pub fn router(self: Arc<Self>) -> Router {
+        self.router_extra(Router::new())
+    }
+    /// Explicit default-off candidate route on this SAME relay/listener/store.
+    #[cfg(feature = "fleet-core")]
+    pub fn router_with_fleet(
+        self: Arc<Self>,
+        fleet: Arc<crate::fleet::relay_channel::FleetRelay>,
+    ) -> Router {
+        self.router_extra(crate::fleet::relay_channel::routes(fleet))
+    }
+    fn router_extra(self: Arc<Self>, extra: Router<Arc<Self>>) -> Router {
         let router = Router::new()
             .route("/health", get(health))
             .route(
@@ -143,7 +154,8 @@ impl Relay {
             .route("/ws", get(upgrade))
             .route("/device/start", post(pair_start))
             .route("/device/poll", post(pair_poll))
-            .route("/mcp", post(mcp));
+            .route("/mcp", post(mcp))
+            .merge(extra);
         let secure = self.origin.starts_with("https:");
         let metadata_url = format!("{}/.well-known/oauth-protected-resource/mcp", self.origin);
         crate::relay_auth::routes(router)

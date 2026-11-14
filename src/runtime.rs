@@ -21,6 +21,8 @@ pub struct Runtime {
     started: Instant,
     // Serialize filesystem mutations, preventing edits from racing other calls in this process.
     fs_gate: Arc<Mutex<()>>,
+    #[cfg(feature = "fleet-core")]
+    fleet_hosts: Arc<Mutex<crate::fleet::host::HostRegistration>>,
 }
 impl Runtime {
     pub fn new(policy: Policy) -> Self {
@@ -32,8 +34,148 @@ impl Runtime {
             history: Mutex::new(VecDeque::new()),
             started: Instant::now(),
             fs_gate: Arc::new(Mutex::new(())),
+            #[cfg(feature = "fleet-core")]
+            fleet_hosts: Arc::new(Mutex::new(crate::fleet::host::HostRegistration::default())),
         }
     }
+    /// Candidate P1 source IO. Reads ONLY the path bound to a fresh Source lease.
+    /// Not a network/CLI/MCP entry point, scanner, durable sender or resume API.
+    #[cfg(feature = "fleet-core")]
+    pub fn open_fleet_source(
+        &self,
+        records: crate::fleet::lease::LeasedRecords,
+    ) -> Result<crate::fleet::source_file::SourceFile<'_>> {
+        crate::fleet::source_file::SourceFile::open(self, records, self.fs_gate.clone())
+    }
+    /// Windows-only LOCAL bounded tree read under this Runtime's current policy.
+    /// No remote manifest authority, snapshot, publication or network capability.
+    #[cfg(feature = "fleet-core")]
+    pub fn scan_fleet_manifest(
+        &self,
+        root: &std::path::Path,
+        limits: crate::fleet::manifest_scan::ScanLimits,
+        cancel: &crate::fleet::sync_exec::CancelToken,
+    ) -> Result<crate::fleet::manifest_scan::ManifestObservation> {
+        crate::fleet::manifest_scan::observe(self, self.fs_gate.clone(), root, limits, cancel)
+    }
+    /// Windows-only LOCAL read-only preflight of an add-only plan destinations.
+    /// Never creates a directory/file and never publishes; not a grant/reservation.
+    #[cfg(feature = "fleet-core")]
+    pub fn preflight_fleet_target(
+        &self,
+        root: &std::path::Path,
+        plan: &crate::fleet::sync_plan::SyncPlan,
+        limits: crate::fleet::target_preflight::PreflightLimits,
+        cancel: &crate::fleet::sync_exec::CancelToken,
+    ) -> Result<crate::fleet::target_preflight::TargetPreflight> {
+        crate::fleet::target_preflight::preflight(
+            self,
+            self.fs_gate.clone(),
+            root,
+            plan,
+            limits,
+            cancel,
+        )
+    }
+    #[cfg(all(test, windows, feature = "fleet-core"))]
+    pub(crate) fn preflight_fleet_target_for_test(
+        &self,
+        root: &std::path::Path,
+        plan: &crate::fleet::sync_plan::SyncPlan,
+        limits: crate::fleet::target_preflight::PreflightLimits,
+        cancel: &crate::fleet::sync_exec::CancelToken,
+        hook: impl FnMut(crate::fleet::target_preflight::PreflightEvent<'_>) -> Result<()>,
+    ) -> Result<crate::fleet::target_preflight::TargetPreflight> {
+        crate::fleet::target_preflight::preflight_with(
+            self,
+            &self.fs_gate,
+            root,
+            plan,
+            limits,
+            cancel,
+            hook,
+        )
+    }
+    #[cfg(all(test, windows, feature = "fleet-core"))]
+    pub(crate) fn scan_fleet_manifest_for_test(
+        &self,
+        root: &std::path::Path,
+        limits: crate::fleet::manifest_scan::ScanLimits,
+        cancel: &crate::fleet::sync_exec::CancelToken,
+        hook: impl FnMut(crate::fleet::manifest_scan::ScanEvent<'_>) -> Result<()>,
+    ) -> Result<crate::fleet::manifest_scan::ManifestObservation> {
+        crate::fleet::manifest_scan::observe_with(self, &self.fs_gate, root, limits, cancel, hook)
+    }
+    // Same registry -> filesystem-gate order as host construction. Holding this
+    // guard through one synchronous source operation makes shutdown wait for
+    // that accepted operation, not idle SourceFile owners. No DB lock is taken.
+    #[cfg(feature = "fleet-core")]
+    pub(crate) fn fleet_source_guard(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, crate::fleet::host::HostRegistration>> {
+        let state = self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
+        ensure!(!state.stopped, "Runtime fleet lifecycle stopped");
+        ensure!(self.policy.allow_transfers, "transfers disabled");
+        Ok(state)
+    }
+    /// Explicit experimental LOCAL host attachment, default paused. No CLI/MCP
+    /// entrypoint invokes this. The borrow pins this Runtime/policy lifetime and
+    /// the host reuses the actual filesystem gate; callers cannot substitute one.
+    #[cfg(feature = "fleet-core")]
+    pub fn open_fleet_host(
+        &self,
+        path: &std::path::Path,
+        limits: crate::fleet::inventory::InventoryLimits,
+    ) -> Result<crate::fleet::host::FleetHost<'_>> {
+        crate::fleet::host::FleetHost::open(self, path, self.fs_gate.clone(), limits)
+    }
+    #[cfg(feature = "fleet-core")]
+    pub(crate) fn fleet_host_claim(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, crate::fleet::host::HostRegistration>> {
+        let state = self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
+        ensure!(!state.stopped, "Runtime fleet lifecycle stopped");
+        ensure!(!state.attached, "Runtime already has a fleet host");
+        Ok(state)
+    }
+    #[cfg(feature = "fleet-core")]
+    pub(crate) fn fleet_host_detach(&self) {
+        let mut state = self
+            .fleet_hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.attached = false;
+        state.control = std::sync::Weak::new();
+    }
+    /// Terminally stop host admission and drain accepted operations, including
+    /// a construction accepted before shutdown. Does not delete data or close
+    /// an externally held host DB: close()/Drop keeps that explicit ownership.
+    /// Runtime::shutdown invokes this too and fails fast on a failed drain.
+    #[cfg(feature = "fleet-core")]
+    pub async fn shutdown_fleet_host(&self) -> Result<()> {
+        let registry = self.fleet_hosts.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let control = {
+                let mut state = registry
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
+                state.stopped = true;
+                state.control.upgrade()
+            };
+            if let Some(control) = control {
+                control.stop_and_drain()?;
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     pub async fn call(&self, tool: &str, args: Value) -> ToolResult {
         if tool.len() > 128 {
             return ToolResult::error("tool name exceeds 128 bytes");
@@ -119,11 +261,21 @@ impl Runtime {
             _ => bail!("unknown or not implemented tool: {tool}"),
         }
     }
+    #[cfg(all(test, feature = "fleet-core"))]
+    pub(crate) fn test_fleet_registration(
+        &self,
+    ) -> Arc<Mutex<crate::fleet::host::HostRegistration>> {
+        self.fleet_hosts.clone()
+    }
     #[cfg(test)]
     pub(crate) fn test_fs_gate(&self) -> Arc<Mutex<()>> {
         self.fs_gate.clone()
     }
     pub async fn shutdown(&self) {
+        #[cfg(feature = "fleet-core")]
+        self.shutdown_fleet_host()
+            .await
+            .expect("fleet host shutdown failed; cannot report drained");
         self.transfers.shutdown();
         self.searches.shutdown();
         self.processes.shutdown().await;

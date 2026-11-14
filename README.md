@@ -105,6 +105,18 @@ $env:FERROC_ADMIN_PASSWORD = '<至少 16 字符的独立强密码>'
 
 完整差异见 [COMPATIBILITY](docs/COMPATIBILITY.md)，安全边界见 [SECURITY](SECURITY.md)。
 
+## Fleet 互传（开发中，尚无可调用网络入口）
+
+默认关闭的 `fleet-core` 已有 P0 候选协议/双签授权/单调租约、保护身份与显式 pin、同库 fence/journal、持久预约、Target DATA/FINISH 和 Windows v9 活跃对象本地结算。最终 ACK 在真实 gate 内一次编码并缓存；重启记录不能重建活跃文件、恢复发布或自动免债。SourceEncoder 是纯记录组件，PeerReportedCompleted 只表示认证对端声明，不是远端私有 IO 证明。
+
+**P1 已开始接入源文件 IO**：`Runtime::open_fleet_source(LeasedRecords)` 只读获批 job 的源路径，绑定 Runtime 目录策略/关停状态、原文件和父目录句柄。每次至多 min(授权片长,64KiB)，读取前后检查对象与租约，计数仍是 bytes_encoded，不是已发送。失败撤销并关闭本轮读取能力，完整编码流 SHA 匹配后才产生 FINISH；它不重新证明后来的源文件快照。没有源端持久 journal 或重启续传；SourceFile 本身不维护传输窗口，调用者仍须限制密文队列。
+
+用户已明确停止 Advisor 咨询，该路径不再作为开发依赖；历史独立签收缺失没有被改写为通过。真实源文件→认证 DATA→本地 Target v9→最终 ACK 是本机 IO 验证，不等于 relay+A+B 三进程、两机或 Linux 验收。现有生产 CLI/GUI、25 工具、`/ws`、BRCX1 和 tag-only CI 不变；默认 router 没有 `/fleet/ws`。显式 library API `Relay::router_with_fleet` 可在同一 relay/listener/Store 挂载候选通道，要求原设备 Bearer 与绑定 grant/角色的一次性 header 票据；不新增服务或 fleet MCP/CLI 工具。真实三测试进程已执行，仍不等于两机、生产 agent 或运营签发验收。
+
+纯 manifest/diff 仍仅提供默认 checksum 的 dry-run，quick 比较任意 mtime 差异，目标额外项保留；该纯组件无触盘/apply/覆盖/删除权限，精确 UTF8 键不证明原生名称等价。新增独立 Windows 本机候选 `Runtime::scan_fleet_manifest` 在当前目录策略和生命周期内有界读取真实树，64KiB 分块哈希；错误不返回部分清单。结果只是 ReadSequence，不防外部已读前缀改写，不是文件系统快照/远程扫描授权/目录同步完成，见[扫描合同](docs/design/fleet-manifest-scan.md)。另有只读目标预检 `Runtime::preflight_fleet_target`：要求每个目标父目录已存在且为私有普通目录、解析后仍在该目标根内、目标名称落在声明式 ASCII 可移植剖面内、目标当前缺失，并把有序 `(path, bytes, sha, job)` 绑定为计划摘要；任一不满足整轮拒绝，绝不建目录/建文件/覆盖。它不授予发布许可，也不构成快照。默认要求父目录全部已存在；显式开启 `allow_planned_directories` 后才接受计划自身声明的目录，缺失者按祖先优先返回给接收方创建，预检本身仍不建目录，见[目标准入合同](docs/design/fleet-target-preflight.md)。P1 已加入 `SourceWindow`：认证 READY 后读取，最多 8 片原密文缓存，只有认证连续覆盖 ACK 释放；乱序旧 ACK 不回退，FINISH 必须排空。Target 活跃 receiver 生成缓存 READY/ACK，竞争时非阻塞 DB 准入，进度不是最终结算。`FleetLink`/IO pump 已复用 Network 的代理/TLS 升级路径，接入同 relay 二进制通道和 Windows v9；已通过独立 relay+Source+Target 测试进程与显式 HTTP 代理对照；另有真实 TCP/WS 队列饱和后5s超时、恢复读完整DATA/SHA、拥塞中撤销，以及实际v9后ACK原生发送失败仍保留本地结算而Source不完成的探针。后者用私有观察接缝触发真实断链，不是生产恢复/投递保证；详见[原生背压合同](docs/design/fleet-backpressure.md)与[续租合同](docs/design/fleet-renewal.md)。下一步是受控任务入口、可信运营签发/进度/取消及真实两机验证，之后才做 P2 目录执行与 P3 QUIC/NAT。
+
+`cargo test --locked --features fleet-core --lib fleet::` 运行候选组件。`scripts/measure-fleet-p0.ps1` 的历史合成 stage 探针不替换 CLI/GUI，也不是新源 IO 或网络吞吐量证明。详见[总体设计](docs/design/fleet-transfers.md)、[P0 历史合同](docs/design/fleet-p0-core.md)、[P1 源 IO 合同](docs/design/fleet-source-io.md)、[有界流控合同](docs/design/fleet-flow-control.md)、[同 relay 通道合同](docs/design/fleet-relay-channel.md)和[研究来源](docs/research/remote-agents-mcp-fleet.md)。
+
 ## 验证
 
 ```powershell

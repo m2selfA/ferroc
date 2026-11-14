@@ -1,5 +1,7 @@
 pub mod config;
 pub mod files;
+#[cfg(feature = "fleet-core")]
+pub mod fleet;
 pub mod gui_service;
 pub mod http_mcp;
 pub mod icons;

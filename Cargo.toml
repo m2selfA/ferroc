@@ -8,6 +8,8 @@ license = "MIT"
 
 [features]
 default = []
+# Default-off fleet components and explicit library relay route; no CLI/MCP entrypoint.
+fleet-core = ["dep:ring"]
 gui = ["dep:windui"]
 
 [[bin]]
@@ -17,6 +19,8 @@ required-features = ["gui"]
 
 [dependencies]
 anyhow = "1"
+# Existing locked TLS/signature implementation, only exposed to fleet-core.
+ring = { version = "=0.17.14", optional = true }
 axum = { version = "0.8", features = ["ws", "form"] }
 base64 = "0.22"
 rusqlite = { version = "0.37", features = ["bundled"] }

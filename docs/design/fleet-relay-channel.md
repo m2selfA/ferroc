@@ -1,0 +1,37 @@
+# P1 same-relay channel and IO pump candidate
+
+## Entry and approval
+
+`fleet-core` remains default-off. Stock `Relay::router()` does NOT mount `/fleet/ws`. Only an explicit local caller of `router_with_fleet(Arc<FleetRelay>)` mounts that native-only route in the SAME Relay router, port, Store and security middleware. No extra service, new relay SQLite, CLI switch or MCP send_file/sync_dir registration is added.
+
+A trusted local coordinator calls `approve_local` with an already validated exact grant and matching source/target device IDs. Candidate is relay-only. Approval produces two one-use random header tickets and stores only SHA256 ticket hashes. Credentials are not URLs, Debug or serialized objects; Network marks the join header sensitive. Existing device Bearer/token row, current tokenHash and not-paused/not-revoked device are required independently. Native protocol header1 is mandatory, Origin/query/multiple auth or ticket headers are refused. Device mismatch does not burn another role's ticket; successful join irreversibly claims that role, including failed upgrades/disconnect. No reconnect/replacement/auto-reapproval of that grant digest in this registry.
+
+IMPORTANT: this API is local routing approval, NOT trusted grant issuance, approved pin import, trusted time service, operational peer registration or filesystem permission. Both peers must independently construct authentic LeasedRecords from their approved pins/dual-sign grant/time anchor and actual Runtime policies. A copied network hello cannot import trust. The test workers explicitly use PUBLIC cfg(test)-only seeds and locally approved synthetic time anchors; they are not an operator recipe or production CLI.
+
+## Admission and bounds
+
+-16 active pairs,32 socket permits,8-message lane per direction;64 lifetime grant-digest approvals including expired pairs. Spent history is bounded by refusing more approvals, not forgetting replay history. Approval TTL is monotonic, positive and at most300s (subsecond permitted) and is only routing lifetime, not a trusted extension of the peer grant.
+- Both roles must join before forwarding. Token rotation, pause, revoke, route.close, peer EOF/error or TTL invalidates the pair and other role; credentials rechecked on each forwarding admission and active monitor ticks nominally every1s. This is not an atomic revocation/rollback guarantee: already queued/in-flight effects may complete, and synchronous Store/OS stalls can delay monitoring. Missing peer is bounded by TTL; an unpaired socket is not read until both join, so its EOF may only be detected at pairing/TTL. Relay routing itself performs no target IO; separately admitted Target owners can already retain persistent obligations.
+- WS frame and reassembled message cap are fleet MAX_FRAME(216+256KiB+16). write_buffer_size0, max_write_buffer_size2*MAX_FRAME. Forwarding moves reference-counted bytes through bounded lanes. One received message may wait for lane capacity; send/enqueue attempts have5s budgets. This is an explicit per-pair/queue bound, NOT526144B total network or global process memory.
+- Relay only checks fixed framing, exact binding/direction and granted DATA chunk/end bounds. It does not decrypt, prove the peer's private IO or replace end-to-end AEAD verification. Corrupt AEAD can be forwarded but the actual peer must reject it. BRC `/ws` text protocol remains separate and unchanged.
+- Reader/writer/auth monitor futures are pinned whole loops once. Monitor success cannot drop a consumed frame or partially sent packet. Pair closure cancels in-flight IO as UNKNOWN effects, never retries/reconstructs/resumes or confirms cleanup.
+
+## Client pump
+
+FleetLink reuses Network's existing proxy/DNS/TLS/HTTP upgrade validation, but sends native fleet headers rather than impersonating a BRC client. relay_url still refuses insecure non-loopback URLs, embedded credentials/query/fragment; this candidate requires the origin URL. No direct fallback behind an explicit proxy. New-route TLS/proxy live qualification is separate from existing connector regression.
+
+Source pump owns actual SourceWindow, with at most8 original DATA ciphertexts plus ONE owned send-copy. It polls authenticated input while that SAME send future remains pending. A bounded8-control burst then polls sending first and yields to preserve timer progress under always-ready input; a whole routing IO deadline is fixed at connect. It does not reconstruct failed send futures, copy an unbounded queue, automatically retransmit or reconnect. Empty/full windows await control, not busy poll.
+
+After full peer-contiguous coverage/window drain, FINISH consumes source IO; AwaitingCommit still needs an authenticated independent final ACK. Even that is only a peer declaration of a receipt, not external attestation of disk state. Source closes its native socket after acceptance. Peer/source journal completion is not persisted.
+
+Windows Target pump owns the ORIGINAL HostReceiver on a dedicated blocking lane, writes authenticated DATA, exports cached cumulative coverage ACK, then consumes FINISH through seal→prepare→original-handle rename→observation→v9 settlement and sends the cached final ACK. It retains the live final owner while attempting ACK. It briefly waits for peer close so the relay can forward the final frame; this is not a second receipt or proof Source accepted. Local settlement followed by ACK/network failure returns an explicit unknown-delivery error and does not undo v9 or delete target. Receiver/candidate Drop retains stage/debt as defined by existing contracts. Source/Target owners must be dropped before host close/Runtime shutdown.
+
+## Verification tiers
+
+Actual loopback WS runs and native three-OS-process workers use the real router, connector, IO owners and Targetv9, with separate role logs/binary hash and full byte/receipt comparison. They are not two-host, operational grant issuance or full agent/MCP acceptance. Source and Target policies use separate fixture directories; file/DB holds are released and original owned processes waited before fixture recycling.
+
+Default-off route, authorization mismatch/replay, existing credentials, framed-binding limits, revoke/pause/TTL/closure, E2E bad-tag contrast, source-file bytes, Target persistent settlement and progress/final distinction require tests. Partial/failing transfers must retain obligations. Existing compile/runtime golden vectors and default proxy tests must still pass, with exact frozen input→actual test exe→raw logs mapping.
+
+## Not delivered by this increment
+
+No production task/grant UI or registration, renew/reconnect/resume, directory scanning/apply, QUIC/NAT/direct path, Linux native qualification, two-host/1GiB/production-scale acceptance or default send_file endpoint. Initial-epoch SourceFile flow still cannot be advertised for arbitrary long transfers without actual lease coverage or a separately designed drained-window renewal contract. No Advisor consultation is required or performed under current instruction.

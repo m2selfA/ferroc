@@ -153,9 +153,33 @@ impl Network {
     /// None means relay 401/403, never a proxy 407. No direct fallback is performed.
     pub async fn websocket(
         &self,
+        url: Url,
+        token: &str,
+        config: WebSocketConfig,
+    ) -> Result<Option<WebSocketStream<reqwest::Upgraded>>> {
+        self.websocket_inner(url, token, config, None).await
+    }
+    /// Same route/TLS/HTTP-upgrade validation; private join secret never in URL.
+    #[cfg(feature = "fleet-core")]
+    pub async fn fleet_websocket(
+        &self,
+        url: Url,
+        token: &str,
+        join: &str,
+        config: WebSocketConfig,
+    ) -> Result<Option<WebSocketStream<reqwest::Upgraded>>> {
+        ensure!(
+            join.len() == 64 && join.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid fleet join credential"
+        );
+        self.websocket_inner(url, token, config, Some(join)).await
+    }
+    async fn websocket_inner(
+        &self,
         mut url: Url,
         token: &str,
         config: WebSocketConfig,
+        join: Option<&str>,
     ) -> Result<Option<WebSocketStream<reqwest::Upgraded>>> {
         let scheme = match url.scheme() {
             "wss" => "https",
@@ -166,11 +190,17 @@ impl Network {
             .map_err(|_| anyhow::anyhow!("invalid WebSocket URL"))?;
         let connect = async {
             let key = generate_key();
-            let response = self
-                .client(None)?
-                .get(url)
-                .bearer_auth(token)
-                .header("X-BRC-Protocol", "1")
+            let request = self.client(None)?.get(url).bearer_auth(token);
+            let request = if let Some(ticket) = join {
+                let mut value = reqwest::header::HeaderValue::from_str(ticket)?;
+                value.set_sensitive(true);
+                request
+                    .header("X-Ferroc-Fleet-Join", value)
+                    .header("X-Ferroc-Fleet-Protocol", "1")
+            } else {
+                request.header("X-BRC-Protocol", "1")
+            };
+            let response = request
                 .header("Connection", "Upgrade")
                 .header("Upgrade", "websocket")
                 .header("Sec-WebSocket-Version", "13")
