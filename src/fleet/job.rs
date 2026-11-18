@@ -10,10 +10,34 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-pub const JOB_VERSION: u16 = 1;
+/// Bumped when the canonical request bytes gained the replace pre-image
+/// condition. Old implementations must reject v2 rather than hash a v1 job that
+/// silently lacks the pre-image binding.
+pub const JOB_VERSION: u16 = 2;
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_IDEMPOTENCY_BYTES: usize = 128;
 pub const MAX_JOBS: usize = 128;
+/// Which lease ceiling applies to a grant.
+///
+/// `Rotating` is the multi-host profile: short leases, mandatory rotation, and a
+/// bounded blast radius if a ticket leaks. `SingleOwner` is for one person
+/// running both ends: one grant for the whole job, no rotation, and the accepted
+/// cost that a leaked grant lives until the job deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseProfile {
+    Rotating,
+    SingleOwner,
+}
+impl LeaseProfile {
+    pub const fn ceiling_ms(self) -> u64 {
+        match self {
+            Self::Rotating => MAX_LEASE_MS,
+            // The validated grant separately requires expires <= job.deadline_ms.
+            // No unrelated file-size-derived time limit in the single-owner path.
+            Self::SingleOwner => u64::MAX,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RoutePolicy {
@@ -33,6 +57,11 @@ pub struct JobSpec {
     pub bytes_total: u64,
     pub sha256: [u8; 32],
     pub overwrite: bool,
+    /// Required when `overwrite` is true: the exact content the target must
+    /// still have at replace time. `None` for no-clobber jobs. This is a
+    /// CALLER claim, not an observation; the receiver re-hashes the real target
+    /// under its own gate and refuses on any difference.
+    pub pre_image_sha256: Option<[u8; 32]>,
     pub route: RoutePolicy,
     pub deadline_ms: u64,
     pub idempotency_key: String,
@@ -93,10 +122,23 @@ impl JobSpec {
             self.bytes_total <= MAX_FILE_BYTES && self.deadline_ms > 0,
             "invalid fleet job size/deadline"
         );
-        ensure!(
-            !self.overwrite,
-            "fleet overwrite not supported by this contract"
-        );
+        match (self.overwrite, self.pre_image_sha256) {
+            (false, None) => {}
+            (false, Some(_)) => {
+                anyhow::bail!("no-clobber job must not carry a replace pre-image")
+            }
+            (true, None) => {
+                anyhow::bail!("replace job requires the expected pre-image digest")
+            }
+            (true, Some(pre)) => {
+                // Replacing a file with identical content is a no-op that would
+                // still spend a full transfer; the planner must not emit it.
+                ensure!(
+                    pre != self.sha256,
+                    "replace job pre-image equals the new content"
+                );
+            }
+        }
         ensure!(
             !self.idempotency_key.is_empty()
                 && self.idempotency_key.len() <= MAX_IDEMPOTENCY_BYTES
@@ -123,6 +165,16 @@ impl JobSpec {
         b.extend_from_slice(&self.bytes_total.to_be_bytes());
         b.extend_from_slice(&self.sha256);
         b.push(u8::from(self.overwrite));
+        // Bind the pre-image inside the same hashed bytes: a replace job cannot
+        // be re-pointed at different existing content without changing the
+        // request, job and grant digests.
+        match self.pre_image_sha256 {
+            Some(pre) => {
+                b.push(1);
+                b.extend_from_slice(&pre);
+            }
+            None => b.push(0),
+        }
         b.push(match self.route {
             RoutePolicy::RelayOnly => 0,
         });
@@ -156,7 +208,12 @@ impl JobSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Permission {
+    /// Create a file that must not exist. Destination is absent at commit.
     SendFileNoClobber,
+    /// Replace a file that must still match the job's pre-image digest. A
+    /// separate permission, not a flag on the create path: a receiver must
+    /// distinguish "may create" from "may destroy existing bytes".
+    ReplaceExistingFile,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -170,6 +227,12 @@ pub struct FileGrant {
 }
 impl FileGrant {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        self.canonical_bytes_with(LeaseProfile::Rotating)
+    }
+    /// Validate the selected local lease ceiling and encode identical wire bytes
+    /// for either profile. The profile is not a signed field; peers independently
+    /// choose it when validating their locally approved grant.
+    pub fn canonical_bytes_with(&self, profile: LeaseProfile) -> Result<Vec<u8>> {
         self.binding.validate()?;
         ensure!(
             self.chunk_bytes > 0 && self.chunk_bytes as usize <= MAX_DATA,
@@ -177,7 +240,7 @@ impl FileGrant {
         );
         ensure!(
             self.expires_at_ms > self.issued_at_ms
-                && self.expires_at_ms - self.issued_at_ms <= MAX_LEASE_MS,
+                && self.expires_at_ms - self.issued_at_ms <= profile.ceiling_ms(),
             "invalid grant lease"
         );
         let mut b = b"ferroc:fleet:grant:v1\0".to_vec();
@@ -185,15 +248,39 @@ impl FileGrant {
         b.extend_from_slice(&self.job_digest);
         b.push(match self.permission {
             Permission::SendFileNoClobber => 1,
+            Permission::ReplaceExistingFile => 2,
         });
         b.extend_from_slice(&self.chunk_bytes.to_be_bytes());
         b.extend_from_slice(&self.issued_at_ms.to_be_bytes());
         b.extend_from_slice(&self.expires_at_ms.to_be_bytes());
+        // The profile deliberately does NOT enter the canonical bytes: those are
+        // a cross-implementation golden contract. A long lease is refused by the
+        // opposing profile's ceiling at validation time, which is where it has to
+        // be refused anyway.
         Ok(b)
     }
     /// Structural validation only. The caller must independently approve local
     /// policy and authenticate the issuer; peer-offered grants are not trust.
+    ///
+    /// Uses the ROTATING profile, which caps a lease at `MAX_LEASE_MS`. A single
+    /// owner running both ends has nobody to rotate against and should use
+    /// `validate_for_profile(job, LeaseProfile::SingleOwner)` instead, so a long
+    /// transfer is authorized once instead of being chopped into lease windows.
     pub fn validate_for(self, job: JobSpec) -> Result<ValidatedGrant> {
+        self.validate_for_profile(job, LeaseProfile::Rotating)
+    }
+    /// Same checks with an explicit lease profile. `SingleOwner` raises the lease
+    /// ceiling to the fixed job deadline; the job deadline bound is unchanged, so
+    /// a grant still cannot outlive the job it authorizes.
+    ///
+    /// This is a POLICY switch, not a security claim: with rotation off, a stolen
+    /// grant stays usable until the job deadline, and there is no epoch rotation
+    /// to bound key exposure. That is the accepted trade-off of one owner.
+    pub fn validate_for_profile(
+        self,
+        job: JobSpec,
+        profile: LeaseProfile,
+    ) -> Result<ValidatedGrant> {
         job.validate()?;
         ensure!(
             job.matches_binding(&self.binding),
@@ -207,11 +294,21 @@ impl FileGrant {
             self.expires_at_ms <= job.deadline_ms,
             "grant exceeds fixed job deadline"
         );
-        let digest = Sha256::digest(self.canonical_bytes()?).into();
+        // The permission and the job's clobber mode must agree in both
+        // directions, so a create grant can never authorize a replacement.
+        ensure!(
+            match self.permission {
+                Permission::SendFileNoClobber => !job.overwrite,
+                Permission::ReplaceExistingFile => job.overwrite,
+            },
+            "grant permission does not match the job's clobber mode"
+        );
+        let digest = Sha256::digest(self.canonical_bytes_with(profile)?).into();
         Ok(ValidatedGrant {
             job,
             grant: self,
             digest,
+            profile,
         })
     }
 }
@@ -221,8 +318,13 @@ pub struct ValidatedGrant {
     job: JobSpec,
     grant: FileGrant,
     digest: [u8; 32],
+    profile: LeaseProfile,
 }
 impl ValidatedGrant {
+    /// Local policy retained across clone/authentication, never inferred from peer data.
+    pub fn lease_profile(&self) -> LeaseProfile {
+        self.profile
+    }
     pub fn job(&self) -> &JobSpec {
         &self.job
     }

@@ -43,11 +43,28 @@ pub enum Kind {
     Cancel = 7,
     StatusRequest = 8,
     Status = 9,
+    /// Renewal handshake, sealed under the CURRENT epoch: the successor binding
+    /// is described but not installed until both sides sign the transcript.
+    RenewOffer = 10,
+    RenewAccept = 11,
+    RenewCommit = 12,
+    /// Target→source: the relay has adopted the successor, so the source may
+    /// resume. Without this the source would send new-epoch DATA into a relay
+    /// that still routes the old binding and the pair would be torn down.
+    RenewCommitted = 13,
+    /// Explicit retained-stage base agreement. Old decoders reject this kind.
+    ResumeReady = 14,
 }
 impl Kind {
     pub fn direction(self) -> Direction {
         match self {
-            Self::Ready | Self::Ack | Self::CommitAck | Self::Status => Direction::TargetToSource,
+            Self::Ready
+            | Self::ResumeReady
+            | Self::Ack
+            | Self::CommitAck
+            | Self::Status
+            | Self::RenewAccept
+            | Self::RenewCommitted => Direction::TargetToSource,
             _ => Direction::SourceToTarget,
         }
     }
@@ -55,7 +72,7 @@ impl Kind {
     pub const fn requires_live_grant(self) -> bool {
         matches!(
             self,
-            Self::Prepare | Self::Ready | Self::Data | Self::Finish
+            Self::Prepare | Self::Ready | Self::ResumeReady | Self::Data | Self::Finish
         )
     }
     pub fn max_payload(self) -> usize {
@@ -79,6 +96,11 @@ impl TryFrom<u8> for Kind {
             7 => Self::Cancel,
             8 => Self::StatusRequest,
             9 => Self::Status,
+            10 => Self::RenewOffer,
+            11 => Self::RenewAccept,
+            12 => Self::RenewCommit,
+            13 => Self::RenewCommitted,
+            14 => Self::ResumeReady,
             _ => bail!("unknown fleet record kind"),
         })
     }

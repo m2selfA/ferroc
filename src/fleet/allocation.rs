@@ -31,8 +31,14 @@ pub struct StageAllocation {
     pub(super) database_parent_id: Option<String>,
     pub(super) file_id: Option<String>,
     pub(super) parent_durability: Option<ParentDurability>,
+    /// Linux O_TMPFILE owner; path is a logical liability, never a stage file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) anonymous: bool,
 }
 impl StageAllocation {
+    pub fn is_anonymous(&self) -> bool {
+        self.anonymous
+    }
     pub fn database_parent_id(&self) -> Option<&str> {
         self.database_parent_id.as_deref()
     }
@@ -78,10 +84,34 @@ impl StageAllocation {
                 && self.database_parent_id.as_ref().is_none_or(|id| valid(id))
                 && self.database_parent_id.is_some() == self.database_id.is_some()
                 && self.file_id.as_ref().is_none_or(|id| valid(id))
-                && self.file_id.is_some() == self.parent_durability.is_some(),
+                && self.file_id.is_some() == self.parent_durability.is_some()
+                && (!self.anonymous || self.parent_id.starts_with("unix-")),
             "invalid allocated object observation"
         );
         Ok(())
+    }
+}
+// Zero links are accepted only here for a live anonymous stage, never DB/key IO.
+pub(super) fn stage_object_id(file: &File, anonymous: bool, published: bool) -> Result<String> {
+    if !anonymous {
+        return file_id(file);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        super::linux_stage::object_id(file, published)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = published;
+        anyhow::bail!("anonymous stage requires Linux live owner")
+    }
+}
+pub(super) fn stage_path_matches(path: &Path, object: &str, anonymous: bool) -> Result<bool> {
+    if anonymous {
+        absent(path)?;
+        Ok(true)
+    } else {
+        Ok(file_id(&open_stage(path)?)? == object)
     }
 }
 fn absent(path: &Path) -> Result<()> {
@@ -118,7 +148,20 @@ fn parent_checked(
         "reserved fleet destination namespace"
     );
     if require_absent {
-        absent(&dest)?;
+        // A replace job's destination must EXIST and be a plain single-link file;
+        // a create job's must be absent. Deriving this from the job (not a caller
+        // flag) keeps the two permissions from being swapped by accident.
+        if s.job().overwrite {
+            ensure!(
+                s.job().pre_image_sha256.is_some(),
+                "replace job lacks a pre-image digest"
+            );
+            let existing = super::source_file::open_object(&dest, false)
+                .context("replace destination is not a plain existing file")?;
+            super::source_file::object_id(&existing, false)?;
+        } else {
+            absent(&dest)?;
+        }
     }
     let dir = open_private(dest.parent().context("destination parent missing")?, true)?;
     let id = directory_id(&dir)?;
@@ -141,6 +184,28 @@ impl FencedConnection {
         fs_gate: Arc<Mutex<()>>,
         limits: InventoryLimits,
     ) -> Result<Snapshot> {
+        self.reserve_stage_inner(key, revision, policy, fs_gate, limits, false)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn reserve_anonymous_stage(
+        &mut self,
+        key: &JobKey,
+        revision: u64,
+        policy: &Policy,
+        fs_gate: Arc<Mutex<()>>,
+        limits: InventoryLimits,
+    ) -> Result<Snapshot> {
+        self.reserve_stage_inner(key, revision, policy, fs_gate, limits, true)
+    }
+    fn reserve_stage_inner(
+        &mut self,
+        key: &JobKey,
+        revision: u64,
+        policy: &Policy,
+        fs_gate: Arc<Mutex<()>>,
+        limits: InventoryLimits,
+        anonymous: bool,
+    ) -> Result<Snapshot> {
         limits.validate()?;
         let _gate = fs_gate
             .lock()
@@ -157,6 +222,14 @@ impl FencedConnection {
                 && s.phase() == Phase::Queued
                 && s.stage().is_none(),
             "allocation owner/revision/phase conflict"
+        );
+        // Anonymous stages may now carry a REPLACEMENT job: the publish step
+        // links once under a job-derived reserved name and renames over the
+        // destination. The authorized pre-image is mandatory, and inventory must
+        // still be clean before any bytes are admitted.
+        ensure!(
+            !anonymous || !s.job().overwrite || s.job().pre_image_sha256.is_some(),
+            "anonymous replacement requires the authorized pre-image"
         );
         let (destination, _directory, parent_id) = parent(policy, s)?;
         let report = inventory::inspect(
@@ -189,6 +262,7 @@ impl FencedConnection {
             database_parent_id: Some(self.fence.database_parent_id()?),
             file_id: None,
             parent_durability: None,
+            anonymous,
         });
         self.fence.check_connection(&self.connection)?;
         self.journal()?.reserve_reference(key, revision, reference)
@@ -265,14 +339,26 @@ impl FencedConnection {
             dest.parent() == reference.path().parent() && parent_id == a.parent_id,
             "reserved parent object changed"
         );
-        let file = new_stage_private(reference.path())?;
+        let file = if a.is_anonymous() {
+            #[cfg(target_os = "linux")]
+            {
+                super::linux_stage::create(&directory)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("anonymous stage creation requires Linux");
+            }
+        } else {
+            new_stage_private(reference.path())?
+        };
         file.sync_all()?;
-        // Ordinary File: closing this handle cannot implicitly delete an unbound file.
+        // Named File drop preserves bytes. Anonymous last-FD drop reclaims the
+        // unlinked inode, but the committed logical reservation always remains.
         after_create(&file, reference)?;
-        let object = file_id(&file)?;
+        let object = stage_object_id(&file, a.is_anonymous(), false)?;
         ensure!(
             file.metadata()?.len() == 0
-                && file_id(&open_stage(reference.path())?)? == object
+                && stage_path_matches(reference.path(), &object, a.is_anonymous())?
                 && directory_id(&open_private(reference.path().parent().unwrap(), true)?)?
                     == parent_id,
             "created stage/parent changed"
@@ -280,7 +366,11 @@ impl FencedConnection {
         #[cfg(unix)]
         let durability = {
             directory.sync_all()?;
-            ParentDurability::Synced
+            if a.is_anonymous() {
+                ParentDurability::Unsupported
+            } else {
+                ParentDurability::Synced
+            }
         };
         #[cfg(not(unix))]
         let durability = {

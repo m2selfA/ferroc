@@ -6,7 +6,7 @@ SourceWindow consumes a not-yet-encoded Runtime SourceFile. It does NOT open a s
 
 - Constructor accepts1..=8 local chunks and checks actual file/Runtime/lease. Authenticated READY chooses min(local,peer) windows before reading source contents. SourceFile alone remains a lower-level unqueued API; future transport must use the wrapper.
 - Full window returns Backpressured without encoding/reading another chunk. Control observation and exact-byte retries remain available. Wait asynchronously for input, do not busy-loop next_record.
-- Up to8 Box ciphertexts, max min(grant chunk,64KiB)+216-byte header+16-byte tag each. Largest retained DATA payload is526144B. This excludes queue metadata, one transient plaintext+encoding buffer, incoming controls, replay book, caller copies and socket buffers; it is NOT a global process/network memory bound.
+- Up to8 Box ciphertexts, each up to the granted chunk (protocol MAX_DATA=256KiB)+216-byte header+16-byte tag. The retained DATA bound is `window*(grant chunk+232)`:526144B for8×64KiB grants,2099008B for8×256KiB grants. This excludes queue metadata, one transient plaintext+encoding buffer, incoming controls, replay book, caller copies and socket buffers; it is NOT a global process/network memory bound.
 - Only authenticated cumulative contiguous ACK at an encoded chunk end releases cached frames. ACK cannot exceed encoded bytes. Selective received count is descriptive, never credit; STATUS Completed never means completion. A valid older ACK sequence is ignored, exact duplicate is idempotent, fresh regressive/mid-chunk/early-final control faults and closes file/clears retained DATA.
 - Corrupt/unrelated-key unauthenticated input does not release capacity or poison a still-valid session. Authenticated semantic faults and lease/Runtime/object failures close it. DATA-stage checks require a live lease BEFORE and AFTER control crypto, even though base protocol ACK permits final settlement after expiry.
 - Retry borrows the original AEAD bytes, never re-encrypts, seeks or resumes. A released offset is unavailable. FINISH consumes only after READY/full encoded stream/full peer-contiguous coverage/empty queue. AwaitingCommit still requires a separate authenticated final ACK; a peer can lie about its IO.
@@ -21,7 +21,7 @@ Controls hold the real gate and use the existing commit no_wait helper: try_lock
 
 Real files and authenticated records exercise empty/one/cross-chunk/8MiB local Targetv9+finalACK, out-of-order DATA and ACK, exact retransmission, full window, zero credit, tamper/wrong key, expiry, Runtime shutdown, source growth/truncation and invalid initial use. Actual DB mutex and SQLite writer controls cover successful read-only access and failed exclusive access, with5000ms timeout restoration. API borrow/clone/import negative compilation gates complement runtime tests.
 
-Release-only128MiB probe writes incrementally, fills an8-frame window, decrypts authenticated records, checks full SHA and exact526144B retained peak, then verifies final peer statement. It is NOT a128MiB Host settlement or network test. Exact frozen counts/hashes/results belong in the verification report.
+Release-only128MiB probe writes incrementally, fills an8-frame window, decrypts authenticated records, checks full SHA and the64KiB fixture's exact526144B retained peak, then verifies final peer statement. It is NOT a128MiB Host settlement or network test. Exact frozen counts/hashes/results belong in the verification report.
 
 ## Subsequent P1 relay candidate
 

@@ -34,6 +34,8 @@ pub struct SyncTemplate<'a> {
 #[serde(rename_all = "camelCase")]
 pub enum PlanMode {
     AddOnly,
+    /// Whole-file replacements allowed, each bound to an observed target digest.
+    AddOrReplace,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +165,29 @@ pub fn plan_add_only(
     diff: &DiffPlan,
     template: &SyncTemplate<'_>,
 ) -> Result<SyncPlan> {
+    plan_inner(source, None, diff, template, PlanMode::AddOnly)
+}
+
+/// Additive planning that may ALSO emit whole-file replacements, but only for
+/// targets the source manifest shows with an explicit digest. A replacement job
+/// carries that digest as its pre-image, so the receiver can refuse if the real
+/// file changed. Type conflicts and blocked subtrees still fail the whole plan.
+pub fn plan_add_or_replace(
+    source: &Manifest,
+    target: &Manifest,
+    diff: &DiffPlan,
+    template: &SyncTemplate<'_>,
+) -> Result<SyncPlan> {
+    plan_inner(source, Some(target), diff, template, PlanMode::AddOrReplace)
+}
+
+fn plan_inner(
+    source: &Manifest,
+    target_manifest: Option<&Manifest>,
+    diff: &DiffPlan,
+    template: &SyncTemplate<'_>,
+    mode: PlanMode,
+) -> Result<SyncPlan> {
     ensure!(
         diff.comparison() == Comparison::Checksum,
         "sync planning requires checksum comparison, not the quick heuristic"
@@ -194,11 +219,17 @@ pub fn plan_add_only(
                 reason,
                 target,
             } => {
-                ensure!(
-                    matches!(target, CopyTarget::Absent),
-                    "sync plan refused: {} needs an overwrite the no-clobber engine does not have",
-                    change.path
-                );
+                let replacing = match (mode, target) {
+                    (_, CopyTarget::Absent) => false,
+                    (PlanMode::AddOnly, CopyTarget::ExistingFile) => {
+                        anyhow::bail!(
+                            "sync plan refused: {} needs an overwrite the no-clobber engine does not have",
+                            change.path
+                        )
+                    }
+                    (PlanMode::AddOrReplace, CopyTarget::ExistingFile) => true,
+                };
+
                 ensure!(
                     change.path.as_str() > last.as_str(),
                     "diff order is not strictly increasing"
@@ -208,6 +239,25 @@ pub fn plan_add_only(
                     .entries()
                     .find(|(path, _)| *path == change.path.as_str())
                     .with_context(|| format!("source manifest missing {}", change.path))?;
+                // Replacements need the OBSERVED target digest as the pre-image.
+                // Taking it from the source entry would authorize overwriting
+                // whatever happens to be there now.
+                let pre_image = if replacing {
+                    match target_manifest
+                        .and_then(|m| m.entries().find(|(p, _)| *p == change.path.as_str()))
+                        .map(|(_, k)| k)
+                    {
+                        Some(EntryKind::File {
+                            sha256: Some(t), ..
+                        }) if t != &[0; 32] => Some(*t),
+                        _ => anyhow::bail!(
+                            "sync plan refused: {} replacement lacks an observed target digest",
+                            change.path
+                        ),
+                    }
+                } else {
+                    None
+                };
                 let EntryKind::File { size, sha256, .. } = entry.1 else {
                     anyhow::bail!("diff selects non-file {}", change.path)
                 };
@@ -228,7 +278,7 @@ pub fn plan_add_only(
                 );
                 let relative = change.path.as_str();
                 let job = JobSpec {
-                    version: 1,
+                    version: super::job::JOB_VERSION,
                     fleet_id: template.fleet_id,
                     source_device: template.source_device,
                     target_device: template.target_device,
@@ -238,7 +288,8 @@ pub fn plan_add_only(
                     destination_path: rooted(template.target_root, relative, "target")?,
                     bytes_total: *bytes,
                     sha256: sha,
-                    overwrite: false,
+                    overwrite: replacing,
+                    pre_image_sha256: pre_image,
                     route: RoutePolicy::RelayOnly,
                     deadline_ms: template.deadline_ms,
                     idempotency_key: format!(
@@ -275,7 +326,7 @@ pub fn plan_add_only(
         }
     }
     Ok(SyncPlan {
-        mode: PlanMode::AddOnly,
+        mode,
         comparison: Comparison::Checksum,
         files,
         directories_ensured: directories.len(),

@@ -45,6 +45,9 @@ cargo build --locked --release
 
 ## Windows GUI（WindUI 预览）
 
+需要把 GUI 接入已有 fleet 批准配置时，以 `--features gui,fleet-core` 构建，启动时增加 `--relay <URL> --home <已配对目录> --fleet-setup <本机v2批准文件>`。`transfer.mcp:true` 才在同一个本机 HTTP MCP 暴露四个传输工具；状态行显示本机任务观察计数。配置不从 relay 导入，停止后再启动才装载新配置。详见 [GUI fleet 接线与验证边界](docs/verification/gui-fleet-peer.md)。
+
+
 ```powershell
 cargo build --locked --release --features gui --bin ferroc-gui
 .\target\release\ferroc-gui.exe --allow-dir E:\work --start
@@ -95,6 +98,8 @@ $env:FERROC_ADMIN_PASSWORD = '<至少 16 字符的独立强密码>'
 
 25 个已注册工具：本地 UTF-8 文件读写、精确编辑、目录操作、受控进程会话、可取消后台搜索、配置只读和内存调用记录。
 
+`fleet-core` 另提供本机只读 `fleet-dir scan / dry-run`：Windows/Linux 目录扫描、精确子树排除、有界分页与 checksum 差异。Linux 原生边界、XFS 真实10万文件和独立产物映射见 [Linux 扫描](docs/verification/linux-fleet-manifest-scan.md)。它不新增 MCP 工具、不 apply、不签发授权；用法和完整记录流校验见 [目录入口](docs/verification/windows-fleet-directory-entry.md)。
+
 - WebSocket protocol v1、设备配对、token header、heartbeat、重连、并发上限、重复请求 ID 拒绝。
 - stdio MCP：initialize、ping、tools/list、tools/call；newline JSON-RPC，单连接顺序执行。
 - 原生 relay：OAuth discovery/DCR/PKCE S256、code 单次兑换、refresh rotation、撤销，远程 MCP，设备管理和元数据审计。`list_devices` 是 relay 额外工具，因此远程共 26 个工具。
@@ -105,15 +110,25 @@ $env:FERROC_ADMIN_PASSWORD = '<至少 16 字符的独立强密码>'
 
 完整差异见 [COMPATIBILITY](docs/COMPATIBILITY.md)，安全边界见 [SECURITY](SECURITY.md)。
 
-## Fleet 互传（开发中，尚无可调用网络入口）
+## Fleet 互传（显式配置候选）
+
+Linux 目标显式候选 `transfer.linuxAnonymousStage: true` 默认接收无覆盖新增；覆盖另须绑定前像的独立批准，见 [Linux 覆盖发布](docs/verification/linux-fleet-replace.md)。该模式要求 O_TMPFILE 和 `/proc/self/fd`，沿同一活跃 owner/lease/journal/收据路径发布原 inode；最后 FD 丢失会回收未链接字节但保留全部持久负债。匿名 stage 不能在最后 FD 丢失后重建或续传；验证层级与限制见 [Linux 接收候选](docs/verification/linux-fleet-receiver.md)。
+
+目标端可显式配置 `transfer.createParentsBelow`，仅在已有私有根下为精确预批准作业创建缺失父目录；默认不创建、失败不回滚目录。Linux 目标还须显式 `linuxAnonymousStage: true`，以 `mkdirat(0700)` 和拒绝 symlink 的目录 FD 检查实现；Linux FD 不阻止祖先改名。它不等于目录扫描／diff／删除，边界与分层证据见 [Windows](docs/verification/windows-fleet-target-directories.md) / [Linux](docs/verification/linux-fleet-target-directories.md)。
+
+`fleet-core` 构建现提供**仅本机配置**的 `ferroc fleet`：加密身份初始化、显式指纹 peer 准入、端点槽配置与撤销，见[本机配置命令](docs/verification/windows-fleet-local-setup.md)。默认构建不包含该命令；它不连接网络、不启用 relay 路由，也不开放 `send_file` / `sync_dir` / `transfer_get` / `transfer_cancel`。
+
+另有显式 `agent --fleet-setup <FILE>` 与 `relay --fleet-setup` 控制链；独立 `relay --fleet-data-config <FILE>` 加载本机精确 round 批准，双方已认证连接分别 present 后才发一次性票据。agent 必须显式配置 `dataRoutes: true` 和本机时间审批；普通路径票据只能由原 `SetupLease` 消费到 `FleetLink`，同一批 records 才能移交给现有 `SourceWindow`/`HostReceiver`。可选的 `transfer` 段显式启用 stock agent 的收发泵（`windowChunks` 1..=8；目标端必须提供绝对、已存在的私有 `hostDb`）。没有 `transfer` 时 stock agent 不自动驱动泵。`transfer.mcp: true` 时 stock agent 额外暴露四个本地 MCP 工具：`send_file`/`sync_dir` 只能启动本机 setup 文件中预批准的 source round，`transfer_get`/`transfer_cancel` 查看或取消本地任务；`sync_dir` 不是目录扫描/差异/覆盖/删除。已用 relay OAuth `/mcp` 实测 3 B 与 8 MiB 的 `send_file`→`transfer_get` 闭环，以及立即取消后 `interrupted` 且无目标文件、保留私有 stage；单 round 与双 round `sync_dir` 均实测到 `peerReportedCompleted`（双 round 目标 2 文件、SHA 一致）。Windows 本机扫描→差异→人工预批准的新增/覆盖已有实传证据；新公网 TLS 3B/8MiB 和 Linux 两机 0B 至 128MiB 已核验完整双端收据，见[Linux 接收记录](docs/verification/linux-fleet-receiver.md)。这些证据不提供通用远程目录授权；`sync_dir` 仍只启动预批准批次。默认关闭，不能把控制成功当作文件互传，见[路由准入边界](docs/verification/windows-fleet-data-route-admission.md)。
 
 默认关闭的 `fleet-core` 已有 P0 候选协议/双签授权/单调租约、保护身份与显式 pin、同库 fence/journal、持久预约、Target DATA/FINISH 和 Windows v9 活跃对象本地结算。最终 ACK 在真实 gate 内一次编码并缓存；重启记录不能重建活跃文件、恢复发布或自动免债。SourceEncoder 是纯记录组件，PeerReportedCompleted 只表示认证对端声明，不是远端私有 IO 证明。
 
-**P1 已开始接入源文件 IO**：`Runtime::open_fleet_source(LeasedRecords)` 只读获批 job 的源路径，绑定 Runtime 目录策略/关停状态、原文件和父目录句柄。每次至多 min(授权片长,64KiB)，读取前后检查对象与租约，计数仍是 bytes_encoded，不是已发送。失败撤销并关闭本轮读取能力，完整编码流 SHA 匹配后才产生 FINISH；它不重新证明后来的源文件快照。没有源端持久 journal 或重启续传；SourceFile 本身不维护传输窗口，调用者仍须限制密文队列。
+**源文件与流控已接线**：`Runtime::open_fleet_source(LeasedRecords)` 只读获批 job 的源路径，绑定 Runtime 目录策略/关停状态、原文件和父目录句柄。每次至多为授权片长且不超过 `MAX_DATA`，读取前后检查对象与租约，计数仍是 bytes_encoded，不是已发送。失败撤销并关闭本轮读取能力，完整编码流 SHA 匹配后才产生 FINISH；它不重新证明后来的源文件快照。没有源端持久 journal 或自动重启续传；`SourceWindow` 按认证 READY/连续 ACK 限制最多八片待确认原密文。
 
-用户已明确停止 Advisor 咨询，该路径不再作为开发依赖；历史独立签收缺失没有被改写为通过。真实源文件→认证 DATA→本地 Target v9→最终 ACK 是本机 IO 验证，不等于 relay+A+B 三进程、两机或 Linux 验收。现有生产 CLI/GUI、25 工具、`/ws`、BRCX1 和 tag-only CI 不变；默认 router 没有 `/fleet/ws`。显式 library API `Relay::router_with_fleet` 可在同一 relay/listener/Store 挂载候选通道，要求原设备 Bearer 与绑定 grant/角色的一次性 header 票据；不新增服务或 fleet MCP/CLI 工具。真实三测试进程已执行，仍不等于两机、生产 agent 或运营签发验收。
+显式 Windows 单次恢复现有独立进程验证：目标须在 DATA 前开启 `transfer.retainedCheckpointBytes`，新 round 再由双方本机明确批准历史 job/checkpoint 与全新 grant、会话和恢复 proof；目标另给 stopped owner/revision。恢复票据只由原 `ResumeSetupLease` 消费，随后以 `RecoveryOnly` 接管同库原 stage，走 schema13 单份负债迁移和真实收发泵。16 MiB 文件在 4 MiB checkpoint 后强制结束旧进程，新进程只编码 12 MiB 后缀，双端收据、SQL、文件 SHA 与原对象 ID 一致；错误 owner/改写前缀均拒绝且保留全债。这是同一 Windows 主机的显式单 lineage 恢复，不是自动重试、重复 lineage、Linux 具名 stage 发布或两机恢复，见 [完整证据与配置边界](docs/verification/fleet-stock-restart.md)。
 
-纯 manifest/diff 仍仅提供默认 checksum 的 dry-run，quick 比较任意 mtime 差异，目标额外项保留；该纯组件无触盘/apply/覆盖/删除权限，精确 UTF8 键不证明原生名称等价。新增独立 Windows 本机候选 `Runtime::scan_fleet_manifest` 在当前目录策略和生命周期内有界读取真实树，64KiB 分块哈希；错误不返回部分清单。结果只是 ReadSequence，不防外部已读前缀改写，不是文件系统快照/远程扫描授权/目录同步完成，见[扫描合同](docs/design/fleet-manifest-scan.md)。另有只读目标预检 `Runtime::preflight_fleet_target`：要求每个目标父目录已存在且为私有普通目录、解析后仍在该目标根内、目标名称落在声明式 ASCII 可移植剖面内、目标当前缺失，并把有序 `(path, bytes, sha, job)` 绑定为计划摘要；任一不满足整轮拒绝，绝不建目录/建文件/覆盖。它不授予发布许可，也不构成快照。默认要求父目录全部已存在；显式开启 `allow_planned_directories` 后才接受计划自身声明的目录，缺失者按祖先优先返回给接收方创建，预检本身仍不建目录，见[目标准入合同](docs/design/fleet-target-preflight.md)。P1 已加入 `SourceWindow`：认证 READY 后读取，最多 8 片原密文缓存，只有认证连续覆盖 ACK 释放；乱序旧 ACK 不回退，FINISH 必须排空。Target 活跃 receiver 生成缓存 READY/ACK，竞争时非阻塞 DB 准入，进度不是最终结算。`FleetLink`/IO pump 已复用 Network 的代理/TLS 升级路径，接入同 relay 二进制通道和 Windows v9；已通过独立 relay+Source+Target 测试进程与显式 HTTP 代理对照；另有真实 TCP/WS 队列饱和后5s超时、恢复读完整DATA/SHA、拥塞中撤销，以及实际v9后ACK原生发送失败仍保留本地结算而Source不完成的探针。后者用私有观察接缝触发真实断链，不是生产恢复/投递保证；详见[原生背压合同](docs/design/fleet-backpressure.md)与[续租合同](docs/design/fleet-renewal.md)。下一步是受控任务入口、可信运营签发/进度/取消及真实两机验证，之后才做 P2 目录执行与 P3 QUIC/NAT。
+用户已明确停止 Advisor 咨询；历史独立签收缺失仍保留。`fleet-core` 默认关闭，默认 router 不挂 `/fleet/ws`；显式 setup/DATA 配置复用同一个 relay/listener/Store，使用原设备认证及一次性角色票据。四个预批准任务工具只在显式 MCP 配置时开放，不新增服务。新版本本机、两机和公网 TLS 的证据分别记录，Linux 原 FD 接收与旧 PUBLIC 夹具也各自留档；这些都不等于运营部署或生产资格。
+
+纯 manifest/diff 仍仅提供默认 checksum 的 dry-run，quick 比较任意 mtime 差异，目标额外项保留；该纯组件无触盘/apply/覆盖/删除权限，精确 UTF8 键不证明原生名称等价。独立 Windows/Linux 本机候选 `Runtime::scan_fleet_manifest` 在当前目录策略和生命周期内有界读取真实树，64KiB 分块哈希；错误不返回部分清单。结果只是 ReadSequence，不防外部已读前缀改写，不是文件系统快照/远程扫描授权/目录同步完成，见[扫描合同](docs/design/fleet-manifest-scan.md)。另有 Windows/Linux 只读目标预检 `Runtime::preflight_fleet_target`（其他平台显式拒绝），并以本机命令 `ferroc fleet-dir preflight --source-root A --target-root B` 暴露（仅 fleet-core）：要求每个目标父目录已存在且为私有普通目录、解析后仍在该目标根内、目标名称落在声明式 ASCII 可移植剖面内、目标当前缺失，并把有序 `(path, bytes, sha, job)` 绑定为计划摘要；任一不满足整轮拒绝，绝不建目录/建文件/覆盖。它不授予发布许可，也不构成快照。默认要求父目录全部已存在；显式开启 `allow_planned_directories` 后才接受计划自身声明的目录，缺失者按祖先优先返回给接收方创建，预检本身仍不建目录，见[目标准入合同](docs/design/fleet-target-preflight.md)。P1 已加入 `SourceWindow`：认证 READY 后读取，最多 8 片原密文缓存，只有认证连续覆盖 ACK 释放；乱序旧 ACK 不回退，FINISH 必须排空。Target 活跃 receiver 生成缓存 READY/ACK，竞争时非阻塞 DB 准入，进度不是最终结算。`FleetLink`/IO pump 已复用 Network 的代理/TLS 升级路径，接入同 relay 二进制通道和 Windows v9；已通过独立 relay+Source+Target 测试进程与显式 HTTP 代理对照；另有真实 TCP/WS 队列饱和后5s超时、恢复读完整DATA/SHA、拥塞中撤销，以及实际v9后ACK原生发送失败仍保留本地结算而Source不完成的探针。后者用私有观察接缝触发真实断链，不是生产恢复/投递保证；详见[原生背压合同](docs/design/fleet-backpressure.md)与[续租合同](docs/design/fleet-renewal.md)。本机任务入口与两机实传已存在；通用远程目录审批/apply、Linux 覆盖和父目录创建、重启续传、QUIC/NAT、生产时钟及交付仍须分别实现和验证。
 
 `cargo test --locked --features fleet-core --lib fleet::` 运行候选组件。`scripts/measure-fleet-p0.ps1` 的历史合成 stage 探针不替换 CLI/GUI，也不是新源 IO 或网络吞吐量证明。详见[总体设计](docs/design/fleet-transfers.md)、[P0 历史合同](docs/design/fleet-p0-core.md)、[P1 源 IO 合同](docs/design/fleet-source-io.md)、[有界流控合同](docs/design/fleet-flow-control.md)、[同 relay 通道合同](docs/design/fleet-relay-channel.md)和[研究来源](docs/research/remote-agents-mcp-fleet.md)。
 

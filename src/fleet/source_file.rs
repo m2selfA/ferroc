@@ -17,14 +17,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[path = "source_prefix.rs"]
+mod source_prefix;
+pub use source_prefix::SourcePrefixObservation;
+
 /// Real source handle and one bounded plaintext chunk per call. Returned DATA is
 /// encoded, NOT sent/acknowledged. Caller must bound queues and preserve exact
-/// ciphertext for retransmission. No file export, restore, clone or seek API.
-/// Full encoded count/SHA must match the approved job before FINISH is exposed.
+/// ciphertext for retransmission. No file export, snapshot restore, clone or seek API.
+/// Actual prefix hash plus NEW encoded suffix must match the approved total/SHA.
 /// Checks serialize this Runtime, not external processes or mapped writers.
 /// FINISH binds the encoded stream, NOT a later snapshot of the source file.
 /// Renewal is explicit and only at an acknowledged boundary; this candidate has
-/// no transport, reconnect, resume or source-journal API.
+/// no transport, reconnect or source-journal API. Explicit local continuation
+/// consumes a dual-proof Source lease and actually rehashes its original FD;
+/// its prefix is historical, not newly encoded or stable current file bytes.
 /// ```compile_fail
 /// fn no_clone(s:ferroc::fleet::source_file::SourceFile<'_>){let _=s.clone();}
 /// ```
@@ -53,6 +59,10 @@ pub struct SourceFile<'r> {
     file_id: String,
     parent_id: String,
     encoder: SourceEncoder,
+    // Heap metadata only. SHA state still comes exclusively from original-FD IO.
+    resume_base: Option<Box<super::control::ResumeBase>>,
+    /// Chunks seen since the last periodic pathname/parent re-check.
+    checks: std::cell::Cell<u64>,
 }
 fn plain(file: &File, directory: bool) -> Result<()> {
     let m = file.metadata()?;
@@ -96,6 +106,8 @@ pub(super) fn open_object(path: &Path, directory: bool) -> Result<File> {
     plain(&file, directory)?;
     Ok(file)
 }
+/// Pathname/parent re-checks are periodic; `finish` still re-verifies both.
+const OBJECT_CHECK_EVERY: u64 = 32;
 pub(super) fn object_id(file: &File, directory: bool) -> Result<String> {
     plain(file, directory)?;
     #[cfg(windows)]
@@ -118,6 +130,18 @@ pub(super) fn object_id(file: &File, directory: bool) -> Result<String> {
     }
 }
 impl<'r> SourceFile<'r> {
+    pub(crate) fn open_resume(
+        runtime: &'r Runtime,
+        owner: super::resume_lease::ResumeLease,
+        gate: Arc<Mutex<()>>,
+        max_prefix_bytes: u64,
+    ) -> Result<Self> {
+        let (condition, records) = owner.into_source()?;
+        let mut source = Self::open(runtime, records, gate)?;
+        source.restore_resume_prefix(&condition, max_prefix_bytes)?;
+        Ok(source)
+    }
+
     pub(crate) fn open(
         runtime: &'r Runtime,
         records: LeasedRecords,
@@ -147,8 +171,10 @@ impl<'r> SourceFile<'r> {
             parent: Some(parent),
             path,
             file_id,
+            checks: std::cell::Cell::new(0),
             parent_id,
             encoder,
+            resume_base: None,
         };
         this.check_objects()?;
         // Opening/metadata IO may itself cross lease expiry. Keep one gate.
@@ -173,6 +199,16 @@ impl<'r> SourceFile<'r> {
                 && file.metadata()?.len() == self.encoder.job().bytes_total,
             "source file identity/size changed"
         );
+        // Re-opening the pathname and the parent on every 64 KiB chunk cost far
+        // more than the read itself. Path substitution cannot affect bytes we
+        // already hold open, and the final finish() re-checks the pathname and
+        // parent before it accepts the stream, so the per-chunk check is a
+        // periodic one instead of a per-chunk one.
+        let seen = self.checks.get().wrapping_add(1);
+        self.checks.set(seen);
+        if !seen.is_multiple_of(OBJECT_CHECK_EVERY) {
+            return Ok(());
+        }
         ensure!(
             object_id(&open_object(&self.path, false)?, false)? == self.file_id,
             "source pathname substituted"
@@ -188,11 +224,18 @@ impl<'r> SourceFile<'r> {
         );
         Ok(())
     }
+    pub(super) fn resume_base(&self) -> Option<&super::control::ResumeBase> {
+        self.resume_base.as_deref()
+    }
     pub(super) fn flow_total(&self) -> u64 {
         self.encoder.job().bytes_total
     }
+    /// Binding the encoder is currently sealing under.
+    pub(super) fn current_binding(&self) -> super::protocol::Binding {
+        self.encoder.current_binding()
+    }
     pub(super) fn flow_chunk_limit(&self) -> usize {
-        self.encoder.io_chunk_bytes().min(65536)
+        self.encoder.io_chunk_bytes()
     }
     pub(super) fn flow_faulted(&self) -> bool {
         self.encoder.flow_faulted()
@@ -212,6 +255,14 @@ impl<'r> SourceFile<'r> {
             self.revoke();
         }
         result
+    }
+    /// Seal a flow control body under the CURRENT epoch. Used by the renewal
+    /// handshake, which must travel before the rotation it describes.
+    pub(super) fn seal_flow_control(
+        &mut self,
+        body: super::control::ControlBody,
+    ) -> Result<Vec<u8>> {
+        self.encoder.seal_flow_control(body)
     }
     pub(super) fn flow_control(&mut self, bytes: &[u8]) -> Result<super::auth::PeerRecord> {
         let result = self.flow_control_inner(bytes);
@@ -256,6 +307,10 @@ impl<'r> SourceFile<'r> {
         a: &[u8; 64],
         b: &[u8; 64],
     ) -> Result<()> {
+        ensure!(
+            self.resume_base.is_none(),
+            "resume source does not rotate its approved base"
+        );
         if let Err(e) = self.renew_prepare() {
             self.revoke();
             return Err(e);
@@ -276,6 +331,13 @@ impl<'r> SourceFile<'r> {
     }
     pub fn bytes_encoded(&self) -> u64 {
         self.encoder.bytes_encoded()
+    }
+    /// Historical same-FD prefix read, NOT newly encoded/sent/received bytes.
+    pub fn resumed_prefix_bytes(&self) -> Option<u64> {
+        self.encoder.resumed_prefix_bytes()
+    }
+    pub fn next_data_offset(&self) -> u64 {
+        self.encoder.next_data_offset()
     }
     pub fn revoke(&mut self) {
         self.encoder.revoke();
@@ -304,13 +366,15 @@ impl<'r> SourceFile<'r> {
         self.encoder.check_source_io()?;
         self.check_objects()?;
         self.encoder.check_source_io()?;
-        let remaining = self.encoder.job().bytes_total - self.encoder.bytes_encoded();
+        let remaining = self.encoder.job().bytes_total - self.encoder.next_data_offset();
         if remaining == 0 {
             return Ok(None);
         }
-        let n = remaining
-            .min(self.encoder.io_chunk_bytes() as u64)
-            .min(65536) as usize;
+        // Honour the granted chunk size (already bounded by MAX_DATA when the
+        // grant was validated). A fixed 64 KiB cap here silently defeated a
+        // larger grant and multiplied the per-chunk object checks and journal
+        // reads, which is what limited large-transfer throughput.
+        let n = remaining.min(self.encoder.io_chunk_bytes() as u64) as usize;
         let mut data = zeroize::Zeroizing::new(vec![0; n]);
         let mut done = 0;
         while done < n {
@@ -330,8 +394,8 @@ impl<'r> SourceFile<'r> {
         self.encoder.check_source_io()?;
         Ok(Some(record))
     }
-    /// Releases source FD only after final size/object/lease and full encoded SHA
-    /// checks. AwaitingCommit is still merely waiting for a peer's authenticated
+    /// Releases source FD only after forced final name/parent/object/lease checks
+    /// and complete actual-prefix/encoded-suffix SHA. AwaitingCommit still waits for peer
     /// statement; it is neither source journal completion nor current target truth.
     pub fn finish(mut self) -> Result<AwaitingCommit> {
         let _life = self.runtime.fleet_source_guard()?;
@@ -340,7 +404,9 @@ impl<'r> SourceFile<'r> {
             .lock()
             .map_err(|_| anyhow::anyhow!("filesystem gate poisoned"))?;
         self.encoder.check_source_io()?;
+        self.checks.set(OBJECT_CHECK_EVERY - 1);
         self.check_objects()?;
+        self.encoder.check_source_io()?;
         let pending = self.encoder.finish()?;
         drop(self.file.take());
         drop(self.parent.take());

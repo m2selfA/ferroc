@@ -72,7 +72,13 @@ impl Mcp {
             }
             "ping" => json!({}),
             _ if !self.initialized => return Some(error(id, -32000, "Initialize first")),
-            "tools/list" => json!({"tools":tools()}),
+            "tools/list" => {
+                #[cfg(feature = "fleet-core")]
+                let list = runtime.tools_for().unwrap_or_else(|_| tools());
+                #[cfg(not(feature = "fleet-core"))]
+                let list = tools();
+                json!({"tools": list})
+            }
             "tools/call" => {
                 let Some(name) = request["params"]["name"].as_str() else {
                     return Some(error(id, -32602, "tool name required"));

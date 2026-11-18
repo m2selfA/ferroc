@@ -360,9 +360,13 @@ fn protocol_fixtures_match_pinned_upstream() {
         name: "test".into(),
         paired_at: "manual".into(),
     };
-    let h = transport::hello(&c);
+    let h = transport::hello(&c, false);
     assert_eq!(h["protocol"], 1);
     assert_eq!(h["device"]["deviceId"], "test");
+    // The default agent must never advertise a capability it does not serve.
+    assert!(h.get("fleetSetupProtocol").is_none());
+    let provisioned = transport::hello(&c, true);
+    assert_eq!(provisioned["fleetSetupProtocol"], 1);
     assert!(!h.to_string().contains("never-in-hello"));
     assert!(transport::relay_url("http://example.com").is_err());
     assert!(transport::relay_url("https://user:pass@example.com").is_err());

@@ -1,22 +1,31 @@
-//! Windows-only LOCAL preflight observation for an existing add-only SyncPlan.
+//! LOCAL preflight observation for an existing add-only SyncPlan. Supported on
+//! Windows and Linux; other platforms refuse explicitly rather than guessing.
 //! Reads names, parents and absence ONLY: it never creates a directory or file,
 //! never publishes, overwrites or deletes, issues no grant and takes no DB lock.
 //! NOT publication permission; the publisher must re-observe under its own gate.
 //! Name rule is a deliberately NARROW ASCII profile, not a Windows-equivalence proof.
+#[cfg(any(windows, target_os = "linux"))]
 use super::{
     fence::{directory_id, local_path},
     identity::open_private,
     manifest::MAX_PATH_BYTES,
     source_file::{object_id, open_object},
+};
+use super::{
     sync_exec::CancelToken,
     sync_plan::{MAX_PLAN_FILES, SyncPlan},
 };
 use crate::runtime::Runtime;
-use anyhow::{Context, Result, ensure};
+#[cfg(any(windows, target_os = "linux"))]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
+#[cfg(any(windows, target_os = "linux"))]
 use std::{
     collections::BTreeMap,
     fs::{self, File},
+};
+use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -24,6 +33,7 @@ use std::{
 pub const MAX_COMPONENT_BYTES: usize = 255;
 /// Marker for a parent that the plan declares but that does not exist yet.
 /// It is NOT an object id and must never be treated as one.
+#[cfg(any(windows, target_os = "linux"))]
 const PLANNED_PARENT_ID: &str = "planned-directory";
 const RESERVED_DEVICES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -47,6 +57,7 @@ impl Default for PreflightLimits {
     }
 }
 impl PreflightLimits {
+    #[cfg(any(windows, target_os = "linux"))]
     fn validate(self) -> Result<()> {
         ensure!(
             self.max_files > 0 && self.max_files <= MAX_PLAN_FILES,
@@ -173,7 +184,7 @@ fn plan_digest(plan: &SyncPlan) -> Result<[u8; 32]> {
 
 /// Declared narrow profile. Anything outside it is refused rather than folded,
 /// so this never claims Unicode/8.3 equivalence for names it did not accept.
-fn portable_component(name: &str) -> Result<()> {
+pub(super) fn portable_component(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty() && name.len() <= MAX_COMPONENT_BYTES,
         "target component length outside portable profile"
@@ -214,18 +225,18 @@ pub(crate) fn preflight(
     limits: PreflightLimits,
     cancel: &CancelToken,
 ) -> Result<TargetPreflight> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         preflight_with(runtime, &gate, root, plan, limits, cancel, |_| Ok(()))
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (runtime, gate, root, plan, limits, cancel);
-        anyhow::bail!("target preflight is a Windows-only candidate; no fallback")
+        anyhow::bail!("target preflight is only implemented on Windows and Linux; no fallback")
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 // Event payloads are consumed only by native cfg(test) probes.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
@@ -234,7 +245,7 @@ pub(crate) struct PreflightEvent<'a> {
     pub(crate) relative: &'a str,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn preflight_with(
     runtime: &Runtime,
     gate: &Mutex<()>,
@@ -528,6 +539,9 @@ pub(crate) fn preflight_with(
     })
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "target_preflight_linux_tests.rs"]
+mod linux_tests;
 #[cfg(all(test, windows))]
 #[path = "target_preflight_tests.rs"]
 mod tests;

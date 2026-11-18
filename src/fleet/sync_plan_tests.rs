@@ -203,3 +203,66 @@ fn plan_limits_and_deadline_bounds_are_enforced() {
     let diff2 = diff(&source2, &m(vec![]), Comparison::Checksum).unwrap();
     assert!(plan_add_only(&source2, &diff2, &bad).is_err());
 }
+
+#[test]
+fn add_or_replace_binds_each_replacement_to_the_observed_target_digest() {
+    let source = m(vec![
+        f("keep.bin", 3, 10, Some(1)),
+        f("new.bin", 4, 11, Some(2)),
+        f("edit.bin", 5, 12, Some(3)),
+    ]);
+    let target = m(vec![
+        f("keep.bin", 3, 10, Some(1)),
+        f("edit.bin", 5, 12, Some(7)),
+    ]);
+    let diff = diff(&source, &target, Comparison::Checksum).unwrap();
+    let plan = plan_add_or_replace(&source, &target, &diff, &template("C:/src", "C:/dst")).unwrap();
+    assert_eq!(plan.mode(), PlanMode::AddOrReplace);
+    assert_eq!(plan.files().len(), 2);
+    let added = plan.files().iter().find(|p| p.path == "new.bin").unwrap();
+    assert!(!added.job().overwrite);
+    assert_eq!(added.job().pre_image_sha256, None);
+    let replaced = plan.files().iter().find(|p| p.path == "edit.bin").unwrap();
+    assert!(replaced.job().overwrite);
+    // Pre-image is the digest OBSERVED on the target, not the source digest.
+    assert_eq!(replaced.job().pre_image_sha256, Some([7u8; 32]));
+    assert_ne!(replaced.job().sha256, [7u8; 32]);
+}
+
+#[test]
+fn add_or_replace_refuses_a_replacement_without_an_observed_target_digest() {
+    // A missing digest already fails inside diff(); this guards the placeholder
+    // case, which would otherwise authorize replacing unknown content.
+    let source = m(vec![f("edit.bin", 5, 12, Some(3))]);
+    let target = m(vec![f("edit.bin", 5, 12, Some(0))]);
+    let diff = diff(&source, &target, Comparison::Checksum).unwrap();
+    let error = plan_add_or_replace(&source, &target, &diff, &template("C:/src", "C:/dst"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("observed target digest"), "{error}");
+}
+
+#[test]
+fn add_or_replace_still_refuses_type_conflicts_and_blocked_subtrees() {
+    let source = m(vec![d("a"), f("a/x.bin", 3, 10, Some(1))]);
+    let target = m(vec![f("a", 3, 10, Some(9))]);
+    let diff = diff(&source, &target, Comparison::Checksum).unwrap();
+    let error = plan_add_or_replace(&source, &target, &diff, &template("C:/src", "C:/dst"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("conflict") || error.contains("blocked"),
+        "{error}"
+    );
+}
+
+#[test]
+fn add_only_mode_still_refuses_replacements() {
+    let source = m(vec![f("edit.bin", 5, 12, Some(3))]);
+    let target = m(vec![f("edit.bin", 5, 12, Some(7))]);
+    let diff = diff(&source, &target, Comparison::Checksum).unwrap();
+    let error = plan_add_only(&source, &diff, &template("C:/src", "C:/dst"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("needs an overwrite"), "{error}");
+}

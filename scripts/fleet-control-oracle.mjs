@@ -43,7 +43,10 @@ const sourceId = keys('70', 0x11), targetId = keys('70', 0x22);
 const sourceX = keys('6e', 0x33), targetX = keys('6e', 0x44);
 // Independently encoded canonical UTF-8 request/job/grant; do not import Rust.
 const text = value => Buffer.concat([u16(Buffer.byteLength(value)), Buffer.from(value)]);
-const request = Buffer.concat([Buffer.from('ferroc:fleet:request:v1\0'), u16(1), repeat(1,16), id('source-A'), id('target-B'), text('/source/α.bin'), text('/target/β.bin'), u64(1048576), sha(plain), Buffer.from([0,0]), u64(5000)]);
+// v2 request: the clobber mode byte is followed by a pre-image presence byte.
+// This fixture is the NO-CLOBBER case, so the presence byte is 0 and no digest
+// follows; a replace request would append 1 + 32 bytes there instead.
+const request = Buffer.concat([Buffer.from('ferroc:fleet:request:v1\0'), u16(2), repeat(1,16), id('source-A'), id('target-B'), text('/source/α.bin'), text('/target/β.bin'), u64(1048576), sha(plain), Buffer.from([0,0,0]), u64(5000)]);
 const stableJob = Buffer.concat([Buffer.from('ferroc:fleet:job:v1\0'), repeat(5,16), repeat(6,16), text('request-1'), request]);
 const jobDigest = sha(stableJob);
 const grantBytes = Buffer.concat([Buffer.from('ferroc:fleet:grant:v1\0'), binding, jobDigest, Buffer.from([1]), u32(262144), u64(100), u64(1000)]);
@@ -60,7 +63,7 @@ const root = Buffer.from(hkdfSync('sha256', shared, sha(auth(0)), Buffer.from('f
 const authenticated = record(root, 0, header, plain);
 const vector = {
   request_hex:request.toString('hex'), parameter_digest_hex:sha(request).toString('hex'), job_hex:stableJob.toString('hex'), job_digest_hex:jobDigest.toString('hex'), grant_hex:grantBytes.toString('hex'), grant_digest_hex:grantDigest.toString('hex'),
-  format:'ferroc-fleet-p0-control-public-v2', warning:'PUBLIC FIXTURE SEEDS: NEVER USE AS REAL DEVICE KEYS',
+  format:'ferroc-fleet-p0-control-public-v3', warning:'PUBLIC FIXTURE SEEDS: NEVER USE AS REAL DEVICE KEYS',
   binding_hex:binding.toString('hex'), header_hex:header.toString('hex'), plaintext_hex:plain.toString('hex'),
   root_hex:repeat(0x42,32).toString('hex'), record_key_hex:lowLevel.key.toString('hex'), nonce_hex:lowLevel.nonce.toString('hex'),
   record_hex:lowLevel.frame.toString('hex'), record_sha256:sha(lowLevel.frame).toString('hex'),

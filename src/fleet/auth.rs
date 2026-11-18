@@ -43,7 +43,49 @@ impl IdentityKey {
             .try_into()
             .expect("Ed25519 public key size")
     }
+    /// Only the closed setup Offer/Response/Confirmation domains, never arbitrary bytes.
+    pub(super) fn sign_setup_message(
+        &self,
+        message: &super::setup::SigningMessage<'_>,
+    ) -> Result<[u8; 64]> {
+        let (expected, bytes) = message.identity_and_bytes()?;
+        ensure!(
+            self.public() == expected,
+            "identity does not match setup role"
+        );
+        Ok(self
+            .0
+            .sign(&bytes)
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 signature size"))
+    }
+    pub(super) fn sign_resume_message(
+        &self,
+        message: &super::resume_condition::SigningMessage<'_>,
+    ) -> Result<[u8; 64]> {
+        let (expected, bytes) = message.identity_and_bytes()?;
+        ensure!(
+            self.public() == expected,
+            "identity does not match resume role"
+        );
+        Ok(self
+            .0
+            .sign(&bytes)
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 signature size"))
+    }
     pub fn sign(&self, t: &Transcript, role: Direction) -> Result<[u8; 64]> {
+        self.sign_with_profile(t, role, super::job::LeaseProfile::Rotating)
+    }
+    /// Explicit local signing policy. This does not approve a grant or a peer pin.
+    pub fn sign_with_profile(
+        &self,
+        t: &Transcript,
+        role: Direction,
+        profile: super::job::LeaseProfile,
+    ) -> Result<[u8; 64]> {
         let expected = match role {
             Direction::SourceToTarget => t.source_identity,
             Direction::TargetToSource => t.target_identity,
@@ -54,7 +96,7 @@ impl IdentityKey {
         );
         Ok(self
             .0
-            .sign(&t.bytes(role)?)
+            .sign(&t.bytes_with_profile(role, profile)?)
             .as_ref()
             .try_into()
             .expect("Ed25519 signature size"))
@@ -113,6 +155,14 @@ impl Transcript {
         }
     }
     pub fn bytes(&self, role: Direction) -> Result<Vec<u8>> {
+        self.bytes_with_profile(role, super::job::LeaseProfile::Rotating)
+    }
+    /// The profile changes validation only, never the canonical signed bytes.
+    pub fn bytes_with_profile(
+        &self,
+        role: Direction,
+        profile: super::job::LeaseProfile,
+    ) -> Result<Vec<u8>> {
         self.binding.validate()?;
         ensure!(
             self.job_digest != [0; 32] && self.grant_digest != [0; 32],
@@ -134,7 +184,7 @@ impl Transcript {
         );
         ensure!(
             self.expires_at_ms > self.issued_at_ms
-                && self.expires_at_ms - self.issued_at_ms <= MAX_LEASE_MS,
+                && self.expires_at_ms - self.issued_at_ms <= profile.ceiling_ms(),
             "invalid handshake lease"
         );
         let mut out = b"ferroc:fleet:auth:v2\0".to_vec();
@@ -204,8 +254,10 @@ impl EphemeralKey {
                 && target_pin.public == t.target_identity,
             "unapproved fleet identity"
         );
-        let source_bytes = t.bytes(Direction::SourceToTarget)?;
-        let target_bytes = t.bytes(Direction::TargetToSource)?;
+        // The profile comes from the locally validated grant, not the transcript.
+        let profile = expected.lease_profile();
+        let source_bytes = t.bytes_with_profile(Direction::SourceToTarget, profile)?;
+        let target_bytes = t.bytes_with_profile(Direction::TargetToSource, profile)?;
         ensure!(
             now_ms >= t.issued_at_ms && now_ms < t.expires_at_ms,
             "handshake lease not live"

@@ -1,7 +1,8 @@
-//! Bounded LOCAL Windows tree observation, not a snapshot or remote scan grant.
-//! No writes, exclusion rules, pagination, apply, cleanup, network or restore.
+//! Bounded LOCAL Windows/Linux tree observation, not a snapshot or remote scan grant.
+//! Exact-subtree exclusions are explicit; no writes, apply, cleanup, network or restore.
 use super::{
     manifest::{Manifest, ManifestLimits},
+    manifest_view::ScanRules,
     sync_exec::CancelToken,
 };
 use crate::runtime::Runtime;
@@ -41,8 +42,12 @@ pub struct ManifestObservation {
     manifest: Manifest,
     bytes_hashed: u64,
     files_hashed: usize,
+    rules_digest: [u8; 32],
 }
 impl ManifestObservation {
+    pub fn rules_digest(&self) -> [u8; 32] {
+        self.rules_digest
+    }
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -69,15 +74,20 @@ pub(crate) fn observe(
     root: &Path,
     limits: ScanLimits,
     cancel: &CancelToken,
+    rules: &ScanRules,
 ) -> Result<ManifestObservation> {
     #[cfg(windows)]
     {
-        observe_with(runtime, &gate, root, limits, cancel, |_| Ok(()))
+        observe_with_rules(runtime, &gate, root, limits, cancel, rules, |_| Ok(()))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = (runtime, gate, root, limits, cancel);
-        anyhow::bail!("local manifest observation is a Windows-only candidate; no fallback")
+        linux::observe(runtime, &gate, root, limits, cancel, rules)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (runtime, gate, root, limits, cancel, rules);
+        anyhow::bail!("local manifest observation requires Windows or Linux; no fallback")
     }
 }
 
@@ -90,13 +100,35 @@ pub(crate) enum ScanEvent<'a> {
     FileChunk(&'a Path, u64),
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub(crate) fn observe_with(
     runtime: &Runtime,
     gate: &Mutex<()>,
     root: &Path,
     limits: ScanLimits,
     cancel: &CancelToken,
+    hook: impl FnMut(ScanEvent<'_>) -> Result<()>,
+) -> Result<ManifestObservation> {
+    observe_with_rules(
+        runtime,
+        gate,
+        root,
+        limits,
+        cancel,
+        &ScanRules::default(),
+        hook,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_with_rules(
+    runtime: &Runtime,
+    gate: &Mutex<()>,
+    root: &Path,
+    limits: ScanLimits,
+    cancel: &CancelToken,
+    rules: &ScanRules,
     hook: impl FnMut(ScanEvent<'_>) -> Result<()>,
 ) -> Result<ManifestObservation> {
     use super::source_file::{object_id, open_object};
@@ -145,6 +177,7 @@ pub(crate) fn observe_with(
         runtime,
         limits,
         cancel,
+        rules,
         hook,
         entries: Vec::new(),
         paths: 0,
@@ -167,6 +200,7 @@ pub(crate) fn observe_with(
         manifest,
         bytes_hashed: scanner.bytes,
         files_hashed: scanner.files,
+        rules_digest: rules.digest(),
     })
 }
 
@@ -175,6 +209,7 @@ struct WindowsScan<'a, F> {
     runtime: &'a Runtime,
     limits: ScanLimits,
     cancel: &'a CancelToken,
+    rules: &'a ScanRules,
     hook: F,
     entries: Vec<super::manifest::ManifestEntry>,
     paths: usize,
@@ -263,6 +298,11 @@ impl<F: FnMut(ScanEvent<'_>) -> Result<()>> WindowsScan<'_, F> {
         initial_names.sort();
         for (child, child_path) in children {
             self.check()?;
+            // Still counted above and retained in directory-name stability checks.
+            // Do not open, traverse, or hash an explicitly excluded subtree.
+            if self.rules.excludes(&child) {
+                continue;
+            }
             let metadata = std::fs::symlink_metadata(&child_path)?;
             if metadata.is_dir() {
                 self.entries.push(ManifestEntry {
@@ -363,6 +403,10 @@ impl<F: FnMut(ScanEvent<'_>) -> Result<()>> WindowsScan<'_, F> {
         })
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "manifest_scan_linux.rs"]
+mod linux;
 
 #[cfg(all(test, windows))]
 #[path = "manifest_scan_tests.rs"]

@@ -662,7 +662,7 @@ fn persisted_identity_and_explicit_pins_authenticate_real_dual_signed_data_round
     let target_pin = a.load_pin("node-B").unwrap();
     let binding = transcript(ap).binding;
     let job = JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: fleet(),
         source_device: binding.source_device,
         target_device: binding.target_device,
@@ -673,6 +673,7 @@ fn persisted_identity_and_explicit_pins_authenticate_real_dual_signed_data_round
         bytes_total: 3,
         sha256: Sha256::digest(b"abc").into(),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: "persisted-pins".into(),

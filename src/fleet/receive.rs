@@ -4,8 +4,15 @@
 #[path = "commit_admission.rs"]
 mod commit_admission;
 pub use commit_admission::CommitCandidate;
-#[cfg(windows)]
+#[path = "prefix_observation.rs"]
+mod prefix_observation;
+#[cfg(any(windows, target_os = "linux"))]
 pub use commit_admission::{FinishedCandidate, ReceiptedCandidate, RenamedCandidate};
+pub use prefix_observation::SyncedPrefixObservation;
+#[path = "receive_resume.rs"]
+mod receive_resume;
+#[path = "retained_receiver.rs"]
+mod retained_receiver;
 #[cfg(test)]
 #[path = "receive_tests.rs"]
 mod tests;
@@ -36,16 +43,41 @@ use std::{
 /// ```compile_fail
 /// fn cannot_clone(r:ferroc::fleet::host::receiver::HostReceiver<'_,'_>){let _=r.clone();}
 /// ```
+/// Journal checkpoint granularity for received bytes (not a resume token).
+const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
+/// Grouped durability for stage appends; see `write_record`.
+const SYNC_EVERY: u64 = 4 * 1024 * 1024;
+/// Target-side view of one renewal handshake: the successor it accepted and the
+/// coverage it promised to install at.
+#[derive(Clone, Debug)]
+struct ReceiverRenewal {
+    generation: u64,
+    next_authorization_id: uuid::Uuid,
+    next_key_epoch: uuid::Uuid,
+    drained_at: u64,
+}
 pub struct HostReceiver<'h, 'r> {
     file: File,
     records: LeasedRecords,
     ranges: ReceiveRanges,
+    /// Verified local recovery prefix, NOT negotiated by ordinary READY.
+    resume_base: Option<Box<crate::fleet::control::ResumeBase>>,
     snapshot: Snapshot,
     faulted: bool,
     published: bool,
     flow_window: Option<u8>,
     flow_ready: Option<Vec<u8>>,
     flow_ack: Option<(u64, u64, Vec<u8>)>,
+    /// Open renewal handshake. One at a time; cleared on install or revoke.
+    renewal: Option<ReceiverRenewal>,
+    /// Bytes appended since the last grouped durability point.
+    unsynced: u64,
+    /// Last received-byte count already committed to the journal. Persisting
+    /// every 64 KiB chunk costs one SQLite commit per chunk, which dominates a
+    /// large transfer; the in-memory ranges stay authoritative for ACKs and the
+    /// seal still requires the complete stage, so a coarser checkpoint cannot
+    /// produce a receipt. It is a checkpoint, never a resume token.
+    persisted: u64,
     // File MUST drop before this operation releases the host's drain counter.
     operation: Operation<'h, 'r>,
 }
@@ -77,10 +109,14 @@ fn check_stage(
             && r.path().parent() == dest.parent(),
         "receive parent/domain changed"
     );
-    let observed = file_id(file)?;
+    let observed = crate::fleet::allocation::stage_object_id(file, a.is_anonymous(), published)?;
     ensure!(
         a.file_id() == Some(observed.as_str())
-            && file_id(&open_stage(if published { &dest } else { r.path() })?)? == observed
+            && if published {
+                file_id(&open_stage(&dest)?)? == observed
+            } else {
+                crate::fleet::allocation::stage_path_matches(r.path(), &observed, a.is_anonymous())?
+            }
             && file.metadata()?.len() <= s.job().bytes_total,
         "receive file object/size changed"
     );
@@ -89,9 +125,31 @@ fn check_stage(
 impl<'r> FleetHost<'r> {
     /// Explicit LOCAL slice. Job comes ONLY from authenticated Target records;
     /// never recreate/reopen on replay. Failure preserves any admitted obligation.
-    pub fn admit_receiver<'h>(
+    pub fn admit_receiver<'h>(&'h self, records: LeasedRecords) -> Result<HostReceiver<'h, 'r>> {
+        self.admit_receiver_inner(records, false)
+    }
+    /// Explicit Linux O_TMPFILE receive. Last-FD loss reclaims unnamed bytes;
+    /// the journal reservation remains full, with no automatic reconciliation.
+    /// A REPLACEMENT job must have arrived with its authorized pre-image; the
+    /// publish step links once under a job-derived reserved name and then renames
+    /// over the destination, so the destination is never partially visible.
+    #[cfg(target_os = "linux")]
+    pub fn admit_linux_anonymous_receiver<'h>(
+        &'h self,
+        records: LeasedRecords,
+    ) -> Result<HostReceiver<'h, 'r>> {
+        if records.grant().job().overwrite {
+            ensure!(
+                records.grant().job().pre_image_sha256.is_some(),
+                "replacement job lost its authorized pre-image"
+            );
+        }
+        self.admit_receiver_inner(records, true)
+    }
+    fn admit_receiver_inner<'h>(
         &'h self,
         mut records: LeasedRecords,
+        anonymous: bool,
     ) -> Result<HostReceiver<'h, 'r>> {
         let operation = self.enter(true)?;
         let now = records.receive_admission()?;
@@ -105,13 +163,30 @@ impl<'r> FleetHost<'r> {
         let db = guard.as_mut().context("host database closed")?;
         let (new, s) = db.journal()?.admit(job, now)?;
         ensure!(new, "receive replay/resume forbidden");
-        let reserved = db.reserve_stage(
-            &key,
-            s.revision(),
-            &self.attachment.runtime.policy,
-            self.gate.clone(),
-            self.limits,
-        )?;
+        let reserved = if anonymous {
+            #[cfg(target_os = "linux")]
+            {
+                db.reserve_anonymous_stage(
+                    &key,
+                    s.revision(),
+                    &self.attachment.runtime.policy,
+                    self.gate.clone(),
+                    self.limits,
+                )?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("anonymous receive requires Linux");
+            }
+        } else {
+            db.reserve_stage(
+                &key,
+                s.revision(),
+                &self.attachment.runtime.policy,
+                self.gate.clone(),
+                self.limits,
+            )?
+        };
         records.receive_admission()?;
         let (bound, file) = db.create_receive_reserved(
             &key,
@@ -132,12 +207,16 @@ impl<'r> FleetHost<'r> {
             file,
             records,
             ranges,
+            resume_base: None,
             snapshot,
             faulted: false,
             published: false,
             flow_window: None,
             flow_ready: None,
             flow_ack: None,
+            renewal: None,
+            unsynced: 0,
+            persisted: 0,
             operation,
         })
     }
@@ -384,6 +463,10 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
         source_signature: &[u8; 64],
         target_signature: &[u8; 64],
     ) -> Result<()> {
+        ensure!(
+            self.resume_base.is_none(),
+            "resume receiver does not rotate its approved base"
+        );
         // Sealed receivers still renew their live epoch (receipts/ACKs), exactly as
         // before; DATA closure is enforced by the flow-control and DATA paths.
         ensure!(!self.faulted, "receiver faulted");
@@ -429,7 +512,8 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
                 && s.revision() == self.snapshot.revision()
                 && s.stage() == self.snapshot.stage()
                 && s.data_seal() == self.snapshot.data_seal()
-                && s.target_observation() == self.snapshot.target_observation(),
+                && s.target_observation() == self.snapshot.target_observation()
+                && s.retained_stage() == self.snapshot.retained_stage(),
             "receiver cancelled/stale"
         );
         check_stage(db, s, &self.file, self.operation.host, self.published)
@@ -438,8 +522,183 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
     /// retry. This is live admission, not a proof of final target completion.
     /// Renewal is allowed after READY only at an acknowledged boundary; cached
     /// control ciphertext is dropped and re-sealed under the current epoch.
+    /// Accept a successor offer at the current coverage boundary and return the
+    /// sealed RENEW_ACCEPT. Nothing is installed yet: the source still has to
+    /// commit, so a peer that walks away here leaves the old epoch in force.
+    pub fn accept_renewal(
+        &mut self,
+        offer_frame: &[u8],
+    ) -> Result<(crate::fleet::control::RenewOffer, Vec<u8>)> {
+        ensure!(
+            self.resume_base.is_none(),
+            "resume receiver does not rotate its approved base"
+        );
+        let opened = self.records.open_record(offer_frame)?;
+        let offer = match opened {
+            crate::fleet::auth::PeerRecord::Control { message, .. } => match message.body {
+                crate::fleet::control::ControlBody::RenewOffer(o) => o,
+                _ => anyhow::bail!("RENEW_ACCEPT expects a RENEW_OFFER frame"),
+            },
+            _ => anyhow::bail!("RENEW_ACCEPT expects a control frame"),
+        };
+        ensure!(
+            !self.faulted && self.snapshot.data_seal().is_none(),
+            "flow receiver faulted or sealed"
+        );
+        ensure!(self.flow_window.is_some(), "renewal requires READY");
+        ensure!(offer.generation > 0, "renewal generation starts at 1");
+        ensure!(self.renewal.is_none(), "renewal handshake already open");
+        // No DATA is being written between frames, so this coverage is exactly
+        // the boundary the source will be told to install at.
+        let drained_at = self.ranges.contiguous();
+        let frame = self
+            .records
+            .seal_control(crate::fleet::control::ControlBody::RenewAccept(
+                crate::fleet::control::RenewAccept {
+                    next_authorization_id: offer.next_authorization_id,
+                    next_key_epoch: offer.next_key_epoch,
+                    generation: offer.generation,
+                    drained_at,
+                },
+            ))?;
+        self.renewal = Some(ReceiverRenewal {
+            generation: offer.generation,
+            next_authorization_id: offer.next_authorization_id,
+            next_key_epoch: offer.next_key_epoch,
+            drained_at,
+        });
+        Ok((offer, frame))
+    }
+    /// Install the successor after the source's RENEW_COMMIT. The commit must
+    /// name exactly the accepted successor and the boundary promised above; a
+    /// mismatch keeps the old epoch and faults this receiver rather than
+    /// installing over bytes that were never acknowledged.
+    pub fn install_renewal(
+        &mut self,
+        commit_frame: &[u8],
+        next: ValidatedGrant,
+        key: EphemeralKey,
+        t: &Transcript,
+        a: &[u8; 64],
+        b: &[u8; 64],
+    ) -> Result<()> {
+        let state = self
+            .renewal
+            .clone()
+            .context("no renewal handshake to install")?;
+        let opened = self.records.open_record(commit_frame)?;
+        let commit = match opened {
+            crate::fleet::auth::PeerRecord::Control { message, .. } => match message.body {
+                crate::fleet::control::ControlBody::RenewCommit(c) => c,
+                _ => anyhow::bail!("RENEW_COMMIT expected"),
+            },
+            _ => anyhow::bail!("RENEW_COMMIT expects a control frame"),
+        };
+        let result = (|| {
+            ensure!(
+                commit.generation == state.generation
+                    && commit.next_authorization_id == state.next_authorization_id
+                    && commit.next_key_epoch == state.next_key_epoch,
+                "RENEW_COMMIT names a different successor"
+            );
+            ensure!(
+                commit.drained_at == state.drained_at,
+                "RENEW_COMMIT agreed a different boundary"
+            );
+            ensure!(
+                next.grant().binding.authorization_id == state.next_authorization_id
+                    && next.grant().binding.key_epoch == state.next_key_epoch,
+                "install grant is not the accepted successor"
+            );
+            ensure!(
+                self.ranges.contiguous() == state.drained_at,
+                "coverage moved since the accept"
+            );
+            self.renew(next, key, t, a, b)
+        })();
+        match result {
+            Ok(()) => {
+                self.renewal = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.revoke();
+                Err(e)
+            }
+        }
+    }
+    /// Test-only: seal an arbitrary confirmation under the CURRENT epoch, so a
+    /// negative case can be authenticated but semantically wrong. Never exposed
+    /// in production, and it does not bypass any check on the way out.
+    #[cfg(all(test, windows))]
+    pub(crate) fn seal_committed_for_test(
+        &mut self,
+        body: crate::fleet::control::RenewCommitted,
+    ) -> Result<Vec<u8>> {
+        self.records
+            .seal_control(crate::fleet::control::ControlBody::RenewCommitted(body))
+    }
+    /// Confirm, sealed under the NEW epoch, that the receiver is installed and
+    /// the relay adopted the successor. The source waits for this before it
+    /// resumes DATA, so the two hosts cannot race the relay's adoption.
+    pub fn renew_committed_record(
+        &mut self,
+        next: &ValidatedGrant,
+        generation: u64,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            self.resume_base.is_none(),
+            "resume receiver does not rotate its approved base"
+        );
+        ensure!(
+            !self.faulted && self.snapshot.data_seal().is_none(),
+            "flow receiver faulted or sealed"
+        );
+        ensure!(self.renewal.is_none(), "renewal handshake still open");
+        ensure!(
+            next.grant().binding.authorization_id
+                == self.records.grant().grant().binding.authorization_id
+                && next.grant().binding.key_epoch == self.records.grant().grant().binding.key_epoch,
+            "RENEW_COMMITTED must describe the installed successor"
+        );
+        self.records
+            .seal_control(crate::fleet::control::ControlBody::RenewCommitted(
+                crate::fleet::control::RenewCommitted {
+                    next_authorization_id: next.grant().binding.authorization_id,
+                    next_key_epoch: next.grant().binding.key_epoch,
+                    generation,
+                },
+            ))
+    }
+    /// Historical prefix re-read at THIS local admission, not network bytes.
+    pub fn resumed_prefix(&self) -> Option<u64> {
+        self.resume_base.as_ref().map(|p| p.prefix_bytes)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_seal_flow_control(
+        &mut self,
+        body: crate::fleet::control::ControlBody,
+    ) -> Result<Vec<u8>> {
+        self.records.seal_control(body)
+    }
+    pub fn resume_ready_record(&mut self, window_chunks: u8) -> Result<&[u8]> {
+        let result = self.prepare_flow_control(Some(window_chunks), true);
+        if result.is_err() {
+            self.revoke();
+        }
+        result?;
+        Ok(self.flow_ready.as_ref().context("resume READY missing")?)
+    }
+    pub fn resume_ack_record(&mut self) -> Result<&[u8]> {
+        let result = self.prepare_flow_control(None, true);
+        if result.is_err() {
+            self.revoke();
+        }
+        result?;
+        Ok(&self.flow_ack.as_ref().context("resume ACK missing")?.2)
+    }
     pub fn ready_record(&mut self, window_chunks: u8) -> Result<&[u8]> {
-        let result = self.prepare_flow_control(Some(window_chunks));
+        let result = self.prepare_flow_control(Some(window_chunks), false);
         if result.is_err() {
             self.revoke();
         }
@@ -449,14 +708,18 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
     /// Cumulative in-memory coverage only. Unchanged counters return the same
     /// exact ciphertext. Holes cannot release SourceWindow's retained prefix.
     pub fn ack_record(&mut self) -> Result<&[u8]> {
-        let result = self.prepare_flow_control(None);
+        let result = self.prepare_flow_control(None, false);
         if result.is_err() {
             self.revoke();
         }
         result?;
         Ok(&self.flow_ack.as_ref().context("ACK missing")?.2)
     }
-    fn prepare_flow_control(&mut self, ready: Option<u8>) -> Result<()> {
+    fn prepare_flow_control(&mut self, ready: Option<u8>, resumed: bool) -> Result<()> {
+        ensure!(
+            self.resume_base.is_some() == resumed,
+            "resume-base negotiation required: flow mode mismatch; ordinary and resume READY/ACK cannot substitute"
+        );
         use crate::fleet::{
             control::{Ack, ControlBody, Ready},
             ranges::WINDOW,
@@ -488,17 +751,29 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
                     Some(old) => ensure!(old == window_chunks, "READY retry changes window"),
                     None => {
                         ensure!(
-                            self.ranges.received() == 0,
+                            self.ranges.received() == self.resumed_prefix().unwrap_or(0)
+                                && self.ranges.contiguous() == self.resumed_prefix().unwrap_or(0),
                             "READY needs valid window before DATA"
                         );
                         self.flow_window = Some(window_chunks);
                     }
                 }
                 if self.flow_ready.is_none() {
-                    let frame = self.records.seal_control(ControlBody::Ready(Ready {
-                        chunk_bytes: self.records.grant().grant().chunk_bytes,
-                        window_chunks,
-                    }))?;
+                    let chunk_bytes = self.records.grant().grant().chunk_bytes;
+                    let body = match &self.resume_base {
+                        Some(base) => {
+                            ControlBody::ResumeReady(crate::fleet::control::ResumeReady {
+                                base: base.as_ref().clone(),
+                                chunk_bytes,
+                                window_chunks,
+                            })
+                        }
+                        None => ControlBody::Ready(Ready {
+                            chunk_bytes,
+                            window_chunks,
+                        }),
+                    };
+                    let frame = self.records.seal_control(body)?;
                     self.flow_ready = Some(frame);
                 }
             } else {
@@ -524,12 +799,23 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
     /// Only encrypted Source DATA accepted. Failure permanently faults this
     /// instance: a burned AEAD sequence must never become a false duplicate ACK.
     pub fn write_record(&mut self, encrypted: &[u8]) -> Result<Admission> {
-        self.write_between(encrypted, |f, o, b, _| {
+        let mut written = 0u64;
+        let admission = self.write_between(encrypted, |f, o, b, _| {
             f.seek(SeekFrom::Start(o))?;
             f.write_all(b)?;
-            f.sync_data()?;
+            written = b.len() as u64;
             Ok(())
-        })
+        })?;
+        // Durability point per chunk is what makes a 64 KiB chunk cost ~23 ms on
+        // NTFS. Grouping them cannot manufacture a receipt: sealing re-reads and
+        // re-hashes the whole stage, and a crash loses only unsynced stage tail,
+        // which leaves the stage (and its debt) with no target file.
+        self.unsynced += written;
+        if self.unsynced >= SYNC_EVERY {
+            self.file.sync_data()?;
+            self.unsynced = 0;
+        }
+        Ok(admission)
     }
     fn write_between(
         &mut self,
@@ -578,11 +864,22 @@ impl<'h, 'r> HostReceiver<'h, 'r> {
             self.records.receive_admission()?;
             self.ranges
                 .record_written(header.offset, bytes.len() as u32, digest)?;
-            self.snapshot = db.journal()?.progress(
-                &JobKey::from_job(self.snapshot.job()),
-                self.snapshot.revision(),
-                self.ranges.received(),
-            )?;
+            let received = self.ranges.received();
+            // Small transfers keep the exact per-chunk journal so their tests and
+            // operators can observe each step; only a large transfer groups the
+            // checkpoints, where per-chunk commits would dominate the run.
+            let total = self.snapshot.job().bytes_total;
+            if received == total
+                || total <= PROGRESS_EVERY
+                || received.saturating_sub(self.persisted) >= PROGRESS_EVERY
+            {
+                self.snapshot = db.journal()?.progress(
+                    &JobKey::from_job(self.snapshot.job()),
+                    self.snapshot.revision(),
+                    received,
+                )?;
+                self.persisted = received;
+            }
             self.records.receive_admission()?;
             Ok(admission)
         })();

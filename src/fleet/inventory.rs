@@ -60,6 +60,8 @@ pub enum FindingKind {
     ControlReference,
     DuplicatePath,
     DuplicateFile,
+    /// Logical anonymous debt cannot be adopted/observed through a pathname.
+    AnonymousStageUnobservable,
     MissingStage,
     UnsafeStage,
     OversizedStage,
@@ -272,6 +274,10 @@ pub(super) fn inspect(
                 }
                 _ => {}
             }
+        }
+        if s.allocation().is_some_and(|a| a.is_anonymous()) {
+            report.finding(FindingKind::AnonymousStageUnobservable, path, limits);
+            continue;
         }
         let observed = (|| -> Result<Option<(PathBuf, String, u64)>> {
             let parent = root(policy, path.parent().context("missing stage parent")?)?;

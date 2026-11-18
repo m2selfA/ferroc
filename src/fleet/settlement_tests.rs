@@ -150,6 +150,7 @@ fn legacy_publication_cannot_restore_completed_from_recovered_history() {
                 size: 3,
                 sha256: s.job().sha256,
                 parent_sync: crate::fleet::stage::ParentSync::Unsupported,
+                mode: crate::fleet::stage::PublishMode::CreateNoClobber,
             },
         )
         .unwrap_err();

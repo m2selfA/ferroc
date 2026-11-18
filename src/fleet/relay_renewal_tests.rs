@@ -1,4 +1,5 @@
 use super::*;
+use crate::fleet::control::{Ack, ControlBody};
 /// Same job, rotated authorization/epoch; other fields are caller-chosen so a
 /// negative case can violate exactly one routing rule.
 fn variant(
@@ -84,35 +85,59 @@ fn advance_local_requires_stable_identity_rotation_and_no_reuse() {
     let mut old_records = records(&g, Direction::SourceToTarget);
     let stale = old_records.seal_data(0, data).unwrap();
     let mut new_records = records(&next, Direction::SourceToTarget);
-    let fresh = new_records.seal_data(0, data).unwrap();
-    let route = pair.route.lock().unwrap();
-    assert!(
-        route.validate(&stale, Direction::SourceToTarget).is_err(),
-        "superseded epoch must not route"
-    );
-    assert!(
-        route.validate(&fresh, Direction::SourceToTarget).is_err(),
-        "only the latest approved successor routes"
-    );
-    drop(route);
+    let _fresh = new_records.seal_data(0, data).unwrap();
+    // The route above already advanced twice, so `next` is the immediately
+    // superseded binding and `newest` is current. Retirement is by delivery
+    // order, not instantly: the superseded binding still routes while frames
+    // sealed under it can be in flight, and stops as soon as BOTH roles have
+    // been seen on the successor.
     let newest = variant(&next, 9002, 9502, session, 65536);
     let mut newest_records = records(&newest, Direction::SourceToTarget);
     let latest = newest_records.seal_data(0, data).unwrap();
+    let mut superseded = records(&next, Direction::SourceToTarget);
+    let in_flight = superseded.seal_data(0, data).unwrap();
+    let route = pair.route.lock().unwrap();
     assert!(
-        pair.route
-            .lock()
-            .unwrap()
-            .validate(&latest, Direction::SourceToTarget)
+        route
+            .validate(&in_flight, Direction::SourceToTarget)
+            .is_ok(),
+        "in-flight frames of the superseded binding must still route"
+    );
+    assert!(
+        route.validate(&latest, Direction::SourceToTarget).is_ok(),
+        "the successor routes immediately after adoption"
+    );
+    assert!(
+        route
+            .validate(&in_flight, Direction::SourceToTarget)
+            .is_ok(),
+        "one role on the successor does not retire the old binding"
+    );
+    // The peer switches too: now nothing older can still be in flight.
+    let mut peer_records = records(&newest, Direction::TargetToSource);
+    let peer_frame = peer_records
+        .seal_control(ControlBody::Ack(Ack {
+            contiguous: 0,
+            received: 0,
+        }))
+        .unwrap();
+    assert!(
+        route
+            .validate(&peer_frame, Direction::TargetToSource)
             .is_ok()
     );
-    // Stale frames stay rejected once the newest binding is live.
     assert!(
-        pair.route
-            .lock()
-            .unwrap()
-            .validate(&stale, Direction::SourceToTarget)
-            .is_err()
+        route
+            .validate(&in_flight, Direction::SourceToTarget)
+            .is_err(),
+        "both roles switched, so the superseded binding retires"
     );
+    // Two generations back never comes back, and the older `g` epoch stays dead.
+    assert!(
+        route.validate(&stale, Direction::SourceToTarget).is_err(),
+        "only the immediately superseded binding is kept, and only until both switch"
+    );
+    drop(route);
 }
 /// Real relay + real file, one mid-transfer epoch rotation at a drained ACK
 /// boundary, then continue to v9. PUBLIC TEST issuance and loopback only.

@@ -216,8 +216,21 @@ pub struct Snapshot {
     settlement_origin: Option<StageReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settlement_binding: Option<super::protocol::Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained: Option<Box<RetainedStageState>>,
 }
+#[path = "checkpoint_journal.rs"]
+mod checkpoint;
+pub use checkpoint::{PrefixCheckpoint, RetainedStageState};
+#[path = "journal_migration.rs"]
+mod migration;
+#[path = "stopped_recovery.rs"]
+mod stopped_recovery;
+
 impl Snapshot {
+    pub fn retained_stage(&self) -> Option<&RetainedStageState> {
+        self.retained.as_deref()
+    }
     /// Historical allocation after explicit settlement; NOT a live reservation,
     /// file location, recovery permission or IO capability.
     pub fn settlement_origin(&self) -> Option<&StageReference> {
@@ -280,6 +293,30 @@ impl Snapshot {
     }
     fn validate(&self) -> Result<()> {
         self.job.validate()?;
+        if let Some(retained) = &self.retained {
+            retained.validate(self, self.version)?;
+        }
+        if self.version == 10 {
+            ensure!(
+                self.retained
+                    .as_ref()
+                    .and_then(|r| r.migration.as_ref())
+                    .is_some(),
+                "migration history missing"
+            );
+            return Ok(());
+        }
+        // Anonymous stages may now carry a REPLACEMENT job: the publish step
+        // links once under a job-derived reserved name and renames over the
+        // destination. Only the legacy-phase guard remains for anonymous rows.
+        ensure!(
+            !self
+                .provenance_stage()
+                .and_then(|s| s.allocation())
+                .is_some_and(|a| a.is_anonymous())
+                || self.version >= 3,
+            "anonymous allocation requires the current phase"
+        );
         ensure!(
             matches!(self.version, 5..=9) == self.data_seal.is_some()
                 && (self.version >= 6) == self.intent_binding.is_some()
@@ -555,7 +592,7 @@ impl<'c> Journal<'c> {
         ensure!(
             matches!(
                 versions.as_slice(),
-                [1] | [2] | [3] | [4] | [5] | [6] | [7] | [8] | [9]
+                [1] | [2] | [3] | [4] | [5] | [6] | [7] | [8] | [9] | [10] | [11] | [12] | [13]
             ),
             "unsupported existing journal schema"
         );
@@ -615,7 +652,7 @@ impl<'c> Journal<'c> {
             ensure!(
                 matches!(
                     versions.as_slice(),
-                    [1] | [2] | [3] | [4] | [5] | [6] | [7] | [8] | [9]
+                    [1] | [2] | [3] | [4] | [5] | [6] | [7] | [8] | [9] | [10] | [11] | [12] | [13]
                 ),
                 "unsupported/ambiguous fleet journal schema version"
             );
@@ -649,7 +686,7 @@ impl<'c> Journal<'c> {
         ensure!(
             matches!(
                 versions.as_slice(),
-                [1] | [2] | [3] | [4] | [5] | [6] | [7] | [8] | [9]
+                [1] | [2] | [3] | [4] | [5] | [6] | [7] | [8] | [9] | [10] | [11] | [12] | [13]
             ),
             "inventory schema unsupported"
         );
@@ -673,6 +710,13 @@ impl<'c> Journal<'c> {
         Ok(rows)
     }
     fn load(c: &Connection, key: &JobKey) -> Result<Option<Snapshot>> {
+        let s = Self::load_one(c, key)?;
+        if let Some(s) = &s {
+            migration::MigrationLink::check_pair(c, s)?;
+        }
+        Ok(s)
+    }
+    fn load_one(c: &Connection, key: &JobKey) -> Result<Option<Snapshot>> {
         let raw:Option<StoredRow>=c.query_row("SELECT fleet,idem,parameters,digest,revision,CASE WHEN length(CAST(body AS BLOB))<=32768 THEN body ELSE NULL END FROM ferroc_fleet_jobs_v1 WHERE k=?1",[key.id()],|r|Ok(StoredRow{fleet:r.get(0)?,idem:r.get(1)?,parameters:r.get(2)?,digest:r.get(3)?,revision:r.get(4)?,body:r.get(5)?})).optional()?;
         let Some(StoredRow {
             fleet,
@@ -694,7 +738,17 @@ impl<'c> Journal<'c> {
                 .collect::<rusqlite::Result<_>>()?
         };
         ensure!(
-            schema.len() == 1 && i64::from(s.version) <= schema[0],
+            schema.len() == 1
+                && (1..=13).contains(&schema[0])
+                && i64::from(s.version) <= schema[0]
+                && (!(s.job.overwrite && s.version >= 7) || schema[0] >= 10)
+                && (!s
+                    .provenance_stage()
+                    .and_then(|r| r.allocation())
+                    .is_some_and(|a| a.is_anonymous())
+                    || matches!(schema[0], 11..=13))
+                && (s.retained.is_none() || schema[0] >= 12)
+                && (s.retained.as_ref().is_none_or(|r| r.migration.is_none()) || schema[0] == 13),
             "journal row exceeds schema gate"
         );
         ensure!(
@@ -717,6 +771,12 @@ impl<'c> Journal<'c> {
     pub fn get(&self, key: &JobKey) -> Result<Option<Snapshot>> {
         self.check_owner()?;
         Self::load(self.connection, key)
+    }
+    /// Read-only listing of every persisted row. Grants no admission, release or
+    /// publication authority; the caller still owns fence/domain verification.
+    pub(super) fn rows(&mut self) -> Result<Vec<Snapshot>> {
+        self.check_owner()?;
+        Self::read_rows(self.connection)
     }
     fn save(c: &Connection, key: &JobKey, old: u64, s: &Snapshot) -> Result<()> {
         s.validate()?;
@@ -745,6 +805,10 @@ impl<'c> Journal<'c> {
         ensure!(
             s.owner == self.owner && s.revision == revision,
             "journal owner/revision conflict"
+        );
+        ensure!(
+            !s.is_migrated_origin(),
+            "migrated origin history is immutable"
         );
         action(&mut s, &tx)?;
         s.revision = s
@@ -813,6 +877,7 @@ impl<'c> Journal<'c> {
             target_observation: None,
             settlement_origin: None,
             settlement_binding: None,
+            retained: None,
         };
         s.validate()?;
         let body = serde_json::to_string(&s)?;
@@ -901,13 +966,18 @@ impl<'c> Journal<'c> {
                 "invalid reservation origin"
             );
             stage.validate()?;
+            let anonymous = a.is_anonymous();
+            ensure!(
+                !anonymous || !s.job.overwrite || s.job.pre_image_sha256.is_some(),
+                "anonymous replacement requires the authorized pre-image"
+            );
             ensure!(
                 Self::read_rows(c)?.iter().all(|r| r.stage.is_none()),
                 "existing durable obligations block allocation"
             );
             ensure!(
                 c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(4,5,6,7,8,9) THEN version ELSE 3 END WHERE version IN(1,2,3,4,5,6,7,8,9)",
+                    if anonymous { "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(12,13) THEN version ELSE 11 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)" } else { "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(4,5,6,7,8,9,10,11,12,13) THEN version ELSE 3 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)" },
                     []
                 )? == 1,
                 "ambiguous allocation schema"
@@ -915,6 +985,48 @@ impl<'c> Journal<'c> {
             s.version = 3;
             s.stage = Some(stage);
             s.phase = Phase::Interrupted;
+            Ok(())
+        })
+    }
+    /// Recovery-side rebinding: the allocation still names the STOPPED origin
+    /// owner (that is what recover_stopped_owner preserved). Only an unbound
+    /// allocation in Interrupted phase owned by the CURRENT fence may be
+    /// bound to a freshly observed object id. NOT a debt release or publication.
+    /// Reachable only from the adopt takeover path (tests until FleetHost
+    /// wiring lands); explicit allow keeps strict lint clean.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn rebind_recovered_reference(
+        &mut self,
+        key: &JobKey,
+        revision: u64,
+        file: &str,
+        durability: ParentDurability,
+        expected_old_owner: uuid::Uuid,
+    ) -> Result<Snapshot> {
+        let owner = self.owner;
+        self.change(key, revision, |s, _| {
+            ensure!(
+                s.phase == Phase::Interrupted,
+                "allocation no longer isolated"
+            );
+            let a = s
+                .stage
+                .as_mut()
+                .and_then(|r| r.allocation.as_mut())
+                .context("missing allocation")?;
+            ensure!(
+                a.owner == expected_old_owner && a.owner != owner,
+                "recovery binding conflict"
+            );
+            // The original admission already bound an object id. The takeover
+            // re-observes the SAME live object; a different id means the file
+            // changed hands and must fail closed.
+            if let Some(existing) = a.file_id.as_ref() {
+                ensure!(existing == file, "recovered stage object changed");
+            } else {
+                a.file_id = Some(file.into());
+            }
+            a.parent_durability = Some(durability);
             Ok(())
         })
     }
@@ -995,7 +1107,7 @@ impl<'c> Journal<'c> {
             );
             ensure!(
                 c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(5,6,7,8,9) THEN version ELSE 4 END WHERE version IN(1,2,3,4,5,6,7,8,9)",
+                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(5,6,7,8,9,10,11,12,13) THEN version ELSE 4 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)",
                     []
                 )? == 1,
                 "ambiguous receive schema"
@@ -1042,7 +1154,7 @@ impl<'c> Journal<'c> {
                 .to_owned();
             ensure!(
                 c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(6,7,8,9) THEN version ELSE 5 END WHERE version IN(1,2,3,4,5,6,7,8,9)",
+                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(6,7,8,9,10,11,12,13) THEN version ELSE 5 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)",
                     []
                 )? == 1,
                 "ambiguous seal schema"
@@ -1093,7 +1205,7 @@ impl<'c> Journal<'c> {
             );
             ensure!(
                 c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(7,8,9) THEN version ELSE 6 END WHERE version IN(1,2,3,4,5,6,7,8,9)",
+                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(7,8,9,10,11,12,13) THEN version ELSE 6 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)",
                     []
                 )? == 1,
                 "ambiguous intent schema"
@@ -1110,7 +1222,7 @@ impl<'c> Journal<'c> {
 
     // Before ONE native publication attempt. A crash/cancel remains unknown,
     // never a restart/adoption/publish/receipt permission or absence release.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) fn mark_publication_attempt(
         &mut self,
         key: &JobKey,
@@ -1127,11 +1239,17 @@ impl<'c> Journal<'c> {
                 "publication attempt out of order"
             );
             fence.check_connection(c)?;
+            // A replacement database is marked 10 so every v7/v8/v9 reader
+            // refuses it at open: those readers would otherwise see the same row
+            // version 7 and treat a replacing rename as a no-clobber one. The
+            // pre-image was re-checked under this same gate immediately before.
+            let statement = if s.job.overwrite {
+                "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(11,12,13) THEN version ELSE 10 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)"
+            } else {
+                "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(8,9,10,11,12,13) THEN version ELSE 7 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)"
+            };
             ensure!(
-                c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(8,9) THEN version ELSE 7 END WHERE version IN(1,2,3,4,5,6,7,8,9)",
-                    []
-                )? == 1,
+                c.execute(statement, [])? == 1,
                 "ambiguous publication schema"
             );
             s.version = 7;
@@ -1142,7 +1260,7 @@ impl<'c> Journal<'c> {
 
     /// Crate-internal LOCAL observation assertion; never a final wire receipt.
     /// Only fresh live Windows ownership can call through the real IO path.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) fn record_target_observation(
         &mut self,
         key: &JobKey,
@@ -1177,7 +1295,7 @@ impl<'c> Journal<'c> {
             fence.check_connection(c)?;
             ensure!(
                 c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version=9 THEN 9 ELSE 8 END WHERE version IN(1,2,3,4,5,6,7,8,9)",
+                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(9,10,11,12,13) THEN version ELSE 8 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)",
                     []
                 )? == 1,
                 "ambiguous target observation schema"
@@ -1199,7 +1317,7 @@ impl<'c> Journal<'c> {
 
     /// LOCAL explicit settlement assertion from the current retained File owner.
     /// Not a restart/peer/metadata completion path. FULL commit may precede error.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) fn settle_live_target(
         &mut self,
         key: &JobKey,
@@ -1233,7 +1351,7 @@ impl<'c> Journal<'c> {
             fence.check_connection(c)?;
             ensure!(
                 c.execute(
-                    "UPDATE ferroc_fleet_meta SET version=9 WHERE version IN(1,2,3,4,5,6,7,8,9)",
+                    "UPDATE ferroc_fleet_meta SET version=CASE WHEN version IN(10,11,12,13) THEN version ELSE 9 END WHERE version IN(1,2,3,4,5,6,7,8,9,10,11,12,13)",
                     []
                 )? == 1,
                 "ambiguous settlement schema"
@@ -1387,7 +1505,7 @@ impl<'c> Journal<'c> {
                 file: Uuid::parse_str(parts[2])?,
             };
             let mut s = Self::load(&tx, &key)?.context("lost recovery row")?;
-            if s.owner != stopped {
+            if s.owner != stopped || s.is_migrated_origin() {
                 continue;
             }
             let old = s.revision;

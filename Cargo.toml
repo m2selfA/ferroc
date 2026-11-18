@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-# Default-off fleet components and explicit library relay route; no CLI/MCP entrypoint.
+# Default-off fleet components, explicit local setup CLI/library relay route; no MCP fleet tools.
 fleet-core = ["dep:ring"]
 gui = ["dep:windui"]
 

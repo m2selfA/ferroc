@@ -108,6 +108,7 @@ impl RunLedger {
         self.entries.len()
     }
     /// Bind the ordered file/job list, not just its length or total bytes.
+    #[cfg(windows)]
     pub(super) fn validate_plan(&self, plan: &SyncPlan) -> Result<()> {
         ensure!(
             self.entries.len() == plan.files().len(),
@@ -125,6 +126,7 @@ impl RunLedger {
         Ok(())
     }
     /// Never adopt a caller's in-flight owner or revive a stopped ledger.
+    #[cfg(windows)]
     pub(super) fn driver_next_index(&self) -> Result<Option<usize>> {
         ensure!(
             self.failure.is_none(),

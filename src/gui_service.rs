@@ -20,6 +20,10 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(all(test, feature = "fleet-core"))]
+#[path = "gui_service_tests.rs"]
+mod tests;
+
 #[derive(Clone)]
 pub struct GuiOptions {
     pub root: PathBuf,
@@ -32,6 +36,10 @@ pub struct GuiOptions {
     pub relay: Option<String>,
     pub home: PathBuf,
     pub name: String,
+    /// Explicit LOCAL fleet setup file. Loaded per connection against the real
+    /// device id; never supplied by the relay or by a remote caller.
+    #[cfg(feature = "fleet-core")]
+    pub fleet_setup: Option<PathBuf>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -42,6 +50,34 @@ pub enum Phase {
     Failed,
     Exited,
 }
+/// Counts from the SAME Runtime attachment used by local MCP. A completed
+/// source task is still only an authenticated peer report, never disk attestation.
+#[cfg(feature = "fleet-core")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FleetTaskSummary {
+    pub pending: usize,
+    pub peer_reported_completed: usize,
+    pub interrupted: usize,
+    pub failed: usize,
+}
+#[cfg(feature = "fleet-core")]
+impl FleetTaskSummary {
+    fn from_snapshots(tasks: Vec<crate::fleet::transfer_tasks::TaskSnapshot>) -> Self {
+        use crate::fleet::transfer_tasks::TaskPhase;
+        let mut summary = Self::default();
+        for task in tasks {
+            match task.phase {
+                TaskPhase::Queued | TaskPhase::Running | TaskPhase::CancelRequested => {
+                    summary.pending += 1
+                }
+                TaskPhase::PeerReportedCompleted => summary.peer_reported_completed += 1,
+                TaskPhase::Interrupted => summary.interrupted += 1,
+                TaskPhase::Failed => summary.failed += 1,
+            }
+        }
+        summary
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuiSnapshot {
     pub phase: Phase,
@@ -51,6 +87,8 @@ pub struct GuiSnapshot {
     pub relay: String,
     pub has_runtime: bool,
     pub http: Option<HttpSnapshot>,
+    #[cfg(feature = "fleet-core")]
+    pub fleet_tasks: Option<FleetTaskSummary>,
 }
 struct State {
     phase: Phase,
@@ -60,6 +98,8 @@ struct State {
     network: String,
     relay: String,
     http: Option<HttpMcp>,
+    #[cfg(feature = "fleet-core")]
+    fleet_runtime: std::sync::Weak<Runtime>,
 }
 #[derive(Clone)]
 pub struct GuiControl {
@@ -92,6 +132,8 @@ impl GuiService {
             network: "未启动".into(),
             relay: "未启用".into(),
             http: None,
+            #[cfg(feature = "fleet-core")]
+            fleet_runtime: std::sync::Weak::new(),
         }));
         let (tx, mut rx) = mpsc::channel(32);
         let control = GuiControl {
@@ -181,6 +223,12 @@ impl GuiControl {
             relay: s.relay.clone(),
             has_runtime: s.http.is_some(),
             http: s.http.as_ref().map(HttpMcp::snapshot),
+            #[cfg(feature = "fleet-core")]
+            fleet_tasks: s
+                .fleet_runtime
+                .upgrade()
+                .and_then(|runtime| runtime.fleet_tasks().ok().flatten()?.snapshots().ok())
+                .map(FleetTaskSummary::from_snapshots),
         }
     }
     pub fn start(&self, options: GuiOptions) -> Result<()> {
@@ -214,6 +262,18 @@ async fn start(options: GuiOptions, state: Arc<Mutex<State>>) -> Result<Running>
     ensure!(
         options.bind.ip().is_loopback(),
         "HTTP MCP仅允许loopback地址，不能绑定公网或局域网接口。"
+    );
+    // A fleet setup file is only meaningful together with a relay connection; a
+    // silent no-op would look like "fleet enabled" while nothing could ever arm.
+    #[cfg(feature = "fleet-core")]
+    ensure!(
+        options.fleet_setup.is_none() || options.relay.is_some(),
+        "fleet setup需要同时配置中继地址：否则本机永远无法装载任何一轮。"
+    );
+    #[cfg(feature = "fleet-core")]
+    ensure!(
+        options.fleet_setup.is_none() || options.allow_transfers,
+        "fleet setup与--no-transfers冲突：传输已被本机策略关闭。"
     );
     let dedicated = if options.no_proxy || options.proxy.is_some() {
         None
@@ -327,8 +387,58 @@ async fn start(options: GuiOptions, state: Arc<Mutex<State>>) -> Result<Running>
             };
             let credentials =
                 tokio::select! { result=connect=>result, _=stopped.changed()=>return };
+            #[cfg(feature = "fleet-core")]
+            let fleet = match (&credentials, options.fleet_setup.as_deref()) {
+                // The provision is loaded HERE, against the real device id, and is
+                // never derived from the relay: a remote frame cannot grant it.
+                (Ok(credentials), Some(path)) => Some(
+                    crate::fleet::setup_config::SetupProvision::load(path, &credentials.device_id)
+                        .and_then(|provision| {
+                            // Registration consumes one Arc handle; the session keeps
+                            // the same provision, so both see identical approvals.
+                            let shared = std::sync::Arc::new(provision);
+                            if shared.mcp_transfer_requested() {
+                                runtime.open_fleet_mcp(shared.clone(), 8)?;
+                                state.lock().expect("GUI state").fleet_runtime =
+                                    Arc::downgrade(&runtime);
+                            }
+                            Ok(shared)
+                        }),
+                ),
+                (Err(_), Some(_)) => None,
+                (_, None) => None,
+            };
             let result = match credentials {
                 Ok(credentials) => {
+                    #[cfg(feature = "fleet-core")]
+                    if let Some(fleet) = fleet {
+                        match fleet {
+                            Ok(provision) => {
+                                transport::run_with_setup_observed_until(
+                                    runtime,
+                                    &credentials,
+                                    &provision,
+                                    false,
+                                    &observe,
+                                    stopped,
+                                )
+                                .await
+                            }
+                            // A rejected provision fails the connection instead of
+                            // silently running without fleet capability.
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        transport::run_observed_until(
+                            runtime,
+                            &credentials,
+                            false,
+                            &observe,
+                            stopped,
+                        )
+                        .await
+                    }
+                    #[cfg(not(feature = "fleet-core"))]
                     transport::run_observed_until(runtime, &credentials, false, &observe, stopped)
                         .await
                 }
@@ -367,6 +477,10 @@ async fn stop(running: Running, state: &Arc<Mutex<State>>) {
     running.runtime.shutdown().await;
     let mut s = state.lock().expect("GUI state");
     s.http = None;
+    #[cfg(feature = "fleet-core")]
+    {
+        s.fleet_runtime = std::sync::Weak::new();
+    }
     s.endpoint = None;
     s.relay = "已停止".into();
 }

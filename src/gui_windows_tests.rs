@@ -58,6 +58,8 @@ fn resident_native_minimize_reopen_tooltip_queue_and_zero_window_exit() {
         relay: None,
         home: root.path().join("home"),
         name: "native probe".into(),
+        #[cfg(feature = "fleet-core")]
+        fleet_setup: None,
     };
     let input = Inputs {
         root: signal(root.path().display().to_string()),

@@ -7,7 +7,7 @@ use super::{
         MAX_RECORDS, device_digest,
     },
     ranges::{Admission, ReceiveRanges, WINDOW},
-    stage::{ParentSync, Publication, StageBudget, StageFile},
+    stage::{ParentSync, Publication, PublishMode, StageBudget, StageFile},
     state::{CommitReceipt, Phase, TransferState},
 };
 use crate::config::Policy;
@@ -58,7 +58,7 @@ fn plaintext(opened: Opened) -> Vec<u8> {
 fn job() -> JobSpec {
     let b = binding();
     JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: b.fleet_id,
         source_device: b.source_device,
         target_device: b.target_device,
@@ -69,6 +69,7 @@ fn job() -> JobSpec {
         bytes_total: 1048576,
         sha256: sha(b"abc"),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: "request-1".into(),
@@ -190,6 +191,8 @@ impl Offer {
 
 #[path = "control_tests.rs"]
 mod control_contract;
+#[path = "lease_profile_tests.rs"]
+mod lease_profile;
 
 #[test]
 fn independent_node_record_golden_vector() {
@@ -697,7 +700,8 @@ fn local_stage_empty_one_byte_and_cross_chunk_roundtrip() {
                     ParentSync::Synced
                 } else {
                     ParentSync::Unsupported
-                }
+                },
+                mode: PublishMode::CreateNoClobber,
             }
         );
         assert_eq!(fs::read(root.path().join("target.bin")).unwrap(), bytes);

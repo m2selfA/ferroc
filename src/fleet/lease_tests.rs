@@ -19,7 +19,7 @@ fn sha(b: &[u8]) -> [u8; 32] {
 }
 fn spec() -> JobSpec {
     JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: Uuid::from_bytes([1; 16]),
         source_device: device_digest("source-A").unwrap(),
         target_device: device_digest("target-B").unwrap(),
@@ -30,6 +30,7 @@ fn spec() -> JobSpec {
         bytes_total: 3,
         sha256: sha(b"abc"),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: "lease-test".into(),
@@ -748,4 +749,57 @@ fn renewed_authenticated_records_continue_real_stage_without_quota_or_coverage_r
     assert_eq!(fs::read(root.path().join("target.bin")).unwrap(), b"abc");
     assert_eq!(budget.usage().unwrap(), (0, 0));
     // Synthetic clock/real file IO component; not cancellable service commit.
+}
+#[test]
+fn single_owner_data_after_sixty_seconds_keeps_one_epoch_and_stops_at_deadline() {
+    use crate::fleet::job::LeaseProfile;
+    let mut offer = Offer::new(0);
+    let mut job = offer.g.job().clone();
+    job.deadline_ms = 180_100;
+    let mut grant = offer.g.grant().clone();
+    grant.job_digest = job.digest().unwrap();
+    grant.expires_at_ms = job.deadline_ms;
+    offer.g = grant
+        .validate_for_profile(job, LeaseProfile::SingleOwner)
+        .unwrap();
+    offer.t = Transcript::for_grant(
+        &offer.g,
+        offer.t.source_identity,
+        offer.t.target_identity,
+        offer.t.source_ephemeral,
+        offer.t.target_ephemeral,
+    );
+    offer.a = IdentityKey::from_test_seed([0x11; 32])
+        .sign_with_profile(
+            &offer.t,
+            Direction::SourceToTarget,
+            LeaseProfile::SingleOwner,
+        )
+        .unwrap();
+    offer.b = IdentityKey::from_test_seed([0x22; 32])
+        .sign_with_profile(
+            &offer.t,
+            Direction::TargetToSource,
+            LeaseProfile::SingleOwner,
+        )
+        .unwrap();
+    let s = ClockSample::now();
+    let (mut source, mut target) = offer.pair(s);
+    let later = at(s, 61_000);
+    let frame = source
+        .seal_data_between(0, b"abc", later, || later)
+        .unwrap();
+    assert_eq!(
+        data(target.open_record_between(&frame, later, || later).unwrap()),
+        b"abc"
+    );
+    assert_eq!(source.epoch_count(), 1);
+    assert_eq!(target.epoch_count(), 1);
+    let deadline = at(s, 179_900);
+    assert!(
+        source
+            .seal_data_between(0, b"x", deadline, || deadline)
+            .is_err()
+    );
+    assert_eq!(source.epoch_count(), 1);
 }

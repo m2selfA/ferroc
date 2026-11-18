@@ -1,6 +1,8 @@
-//! Windows-only LOCAL publication attempt, not final commit/receipt/P1.
+//! Retained-owner publication: Windows handle rename; explicit Linux anonymous FD link.
 use super::*;
+#[cfg(windows)]
 use std::path::Path;
+#[cfg(windows)]
 use std::{
     ffi::c_void,
     os::windows::{ffi::OsStrExt, io::AsRawHandle},
@@ -9,6 +11,7 @@ use std::{
 #[path = "target_receipt.rs"]
 mod target_receipt;
 pub use target_receipt::{FinishedCandidate, ReceiptedCandidate};
+#[cfg(windows)]
 #[repr(C)]
 struct RenameInfo {
     flags: u32,
@@ -16,6 +19,7 @@ struct RenameInfo {
     length: u32,
     name: [u16; 1],
 }
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetFileInformationByHandle(
@@ -27,7 +31,21 @@ unsafe extern "system" {
 }
 // NO source-path operation or fallback. Destination comes from actual policy +
 // pinned parent. RootDirectory-relative Win32 form failed os87 in native probe.
+#[cfg(windows)]
 fn rename_exact(file: &File, destination: &Path) -> Result<()> {
+    rename_with(file, destination, 0)
+}
+// Replace variant: FILE_RENAME_INFO's union member ReplaceIfExists is a BOOLEAN
+// occupying the first byte, so flags = 1 means "replace the existing target".
+// Only reachable for a replacement job whose pre-image was just re-hashed under
+// this same gate. No POSIX-semantics flag is requested: an open handle on the
+// old file makes the call FAIL, which stays Uncertain rather than being retried.
+#[cfg(windows)]
+fn rename_replace(file: &File, destination: &Path) -> Result<()> {
+    rename_with(file, destination, 1)
+}
+#[cfg(windows)]
+fn rename_with(file: &File, destination: &Path, replace_if_exists: u32) -> Result<()> {
     ensure!(
         destination.is_absolute(),
         "native destination must be absolute"
@@ -42,9 +60,10 @@ fn rename_exact(file: &File, destination: &Path) -> Result<()> {
     let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
     let p = storage.as_mut_ptr().cast::<RenameInfo>();
     // SAFETY: pointer-aligned zeroed buffer covers fixed layout and UTF16 name;
-    // File retained throughout synchronous call. flags=0 NEVER replaces target.
+    // File retained throughout synchronous call. flags=0 NEVER replaces target;
+    // flags=1 replaces it and is only reachable from the replacement branch.
     unsafe {
-        (*p).flags = 0;
+        (*p).flags = replace_if_exists;
         (*p).root = null_mut();
         (*p).length = bytes;
         std::ptr::copy_nonoverlapping(
@@ -78,11 +97,11 @@ pub struct RenamedCandidate<'h, 'r> {
     inner: CommitCandidate<'h, 'r>,
 }
 impl RenamedCandidate<'_, '_> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(in super::super) fn test_expire(&mut self) {
         self.inner.test_expire();
     }
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(in super::super) fn test_move(&self, p: &Path) -> Result<()> {
         self.inner.test_move_owned(p)
     }
@@ -107,7 +126,7 @@ impl RenamedCandidate<'_, '_> {
     }
 }
 impl<'h, 'r> CommitCandidate<'h, 'r> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(in super::super) fn test_move_owned(&self, destination: &Path) -> Result<()> {
         rename_exact(&self.inner.inner.file, destination)
     }
@@ -133,6 +152,16 @@ impl<'h, 'r> CommitCandidate<'h, 'r> {
                     && self.snapshot().phase() == Phase::Committing
                     && !self.snapshot().is_publication_attempt(),
                 "invalid live publication candidate"
+            );
+            #[cfg(target_os = "linux")]
+            ensure!(
+                self.snapshot()
+                    .stage()
+                    .and_then(|r| r.allocation())
+                    .is_some_and(|a| a.is_anonymous())
+                    && (!self.snapshot().job().overwrite
+                        || self.snapshot().job().pre_image_sha256.is_some()),
+                "Linux publication requires the explicit anonymous owner and a replacement pre-image"
             );
             let host = self.inner.inner.operation.host;
             let _gate = host
@@ -211,7 +240,46 @@ impl<'h, 'r> CommitCandidate<'h, 'r> {
                     self.inner.inner.file.metadata()?.len() == total,
                     "publication final size changed"
                 );
-                rename_exact(&self.inner.inner.file, &dest)?;
+                // The pre-image is a caller authorization, so it is re-checked
+                // against the real destination here, inside this gate and after
+                // the stage was fully re-hashed. A difference refuses the whole
+                // attempt and leaves the stage debt intact.
+                if s.job().overwrite {
+                    let expected = s
+                        .job()
+                        .pre_image_sha256
+                        .context("replacement job lost its pre-image")?;
+                    let (current, bytes) = crate::fleet::stage::digest_existing(&dest)?;
+                    ensure!(
+                        current == expected,
+                        "destination no longer matches the authorized pre-image"
+                    );
+                    ensure!(bytes > 0, "authorized pre-image is empty");
+                    #[cfg(windows)]
+                    rename_replace(&self.inner.inner.file, &dest)?;
+                    // Linux: the anonymous stage cannot be renamed by path. Link it
+                    // once under a job-derived reserved name, then rename that name
+                    // over the destination. A failure after the link leaves the
+                    // reserved name behind and keeps every obligation.
+                    #[cfg(target_os = "linux")]
+                    crate::fleet::linux_stage::replace(
+                        &self.inner.inner.file,
+                        &guard,
+                        dest.file_name().context("target name missing")?,
+                        &crate::fleet::linux_stage::replace_temporary(
+                            &self.snapshot().job().digest()?,
+                        ),
+                    )?;
+                } else {
+                    #[cfg(windows)]
+                    rename_exact(&self.inner.inner.file, &dest)?;
+                    #[cfg(target_os = "linux")]
+                    crate::fleet::linux_stage::publish(
+                        &self.inner.inner.file,
+                        &guard,
+                        dest.file_name().context("target name missing")?,
+                    )?;
+                }
                 self.inner.inner.published = true;
                 self.inner.inner.records.receive_admission()?;
                 let _again = self.inner.inner.current_snapshot(db, &s)?;

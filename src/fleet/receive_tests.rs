@@ -1,8 +1,28 @@
 use super::*;
+#[path = "adopt_receiver_tests.rs"]
+mod adopt_receiver_tests;
+#[path = "adopt_stage_tests.rs"]
+mod adopt_stage_tests;
 #[path = "flow_control_tests.rs"]
 mod flow_control_tests;
 #[path = "commit_admission_tests.rs"]
 mod intent_tests;
+#[cfg(target_os = "linux")]
+#[path = "linux_receiver_tests.rs"]
+mod linux_receiver_tests;
+#[path = "prefix_observation_tests.rs"]
+mod prefix_observation_tests;
+#[cfg(windows)]
+#[path = "replace_host_tests.rs"]
+mod replace_host_tests;
+#[path = "resume_admission_tests.rs"]
+mod resume_admission_tests;
+#[path = "resume_journal_tests.rs"]
+mod resume_journal_tests;
+#[path = "resume_receiver_tests.rs"]
+mod resume_receiver_tests;
+#[path = "retained_checkpoint_tests.rs"]
+mod retained_checkpoint_tests;
 use crate::{
     config::Policy,
     fleet::{
@@ -45,7 +65,7 @@ impl Offer {
     }
     fn tagged(path: &Path, data: &[u8], generation: u64, tag: u8) -> Self {
         let job = JobSpec {
-            version: 1,
+            version: crate::fleet::job::JOB_VERSION,
             fleet_id: Uuid::from_bytes([1; 16]),
             source_device: device_digest("source-A").unwrap(),
             target_device: device_digest("target-B").unwrap(),
@@ -64,6 +84,7 @@ impl Offer {
             bytes_total: data.len() as u64,
             sha256: Sha256::digest(data).into(),
             overwrite: false,
+            pre_image_sha256: None,
             route: RoutePolicy::RelayOnly,
             deadline_ms: 60100,
             idempotency_key: if tag == 0 {
@@ -116,7 +137,10 @@ impl Offer {
             tp: DevicePin::approved("target-B", tk.public()).unwrap(),
         }
     }
-    fn pair(self) -> (LeasedRecords, LeasedRecords) {
+    /// Anchor window [anchor_earliest, anchor_latest]; the DEFAULT pair uses
+    /// the generation-0 window (200,200). Tests with generation >= 1 grants
+    /// (issued 201) pass an in-lease window explicitly.
+    fn pair_in_window(self, earliest_ms: u64, latest_ms: u64) -> (LeasedRecords, LeasedRecords) {
         let sample = ClockSample::now();
         let one = self
             .source
@@ -128,7 +152,7 @@ impl Offer {
                 &self.tp,
                 &self.a,
                 &self.b,
-                TrustedTimeAnchor::approved_window(sample, 200, 200).unwrap(),
+                TrustedTimeAnchor::approved_window(sample, earliest_ms, latest_ms).unwrap(),
             )
             .unwrap();
         let two = self
@@ -141,10 +165,13 @@ impl Offer {
                 &self.tp,
                 &self.a,
                 &self.b,
-                TrustedTimeAnchor::approved_window(sample, 200, 200).unwrap(),
+                TrustedTimeAnchor::approved_window(sample, earliest_ms, latest_ms).unwrap(),
             )
             .unwrap();
         (one, two)
+    }
+    fn pair(self) -> (LeasedRecords, LeasedRecords) {
+        self.pair_in_window(200, 200)
     }
 }
 fn open<'h, 'r>(

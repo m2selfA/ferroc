@@ -149,7 +149,13 @@ pub fn issue_for_plan(plan: &SyncPlan, template: &GrantTemplate) -> Result<Grant
                 key_epoch,
             },
             job_digest: job.digest()?,
-            permission: Permission::SendFileNoClobber,
+            // The permission must mirror the job's clobber mode; validate_for
+            // rejects a mismatch in either direction.
+            permission: if job.overwrite {
+                Permission::ReplaceExistingFile
+            } else {
+                Permission::SendFileNoClobber
+            },
             chunk_bytes,
             issued_at_ms: template.issued_at_ms,
             expires_at_ms,

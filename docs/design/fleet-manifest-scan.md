@@ -2,17 +2,20 @@
 
 ## Scope
 
-Candidate Windows-only synchronous library API on the existing Runtime. It reads
+Candidate Windows/Linux synchronous library API on the existing Runtime. It reads
 an explicitly selected local root under the current Policy and transfer/lifecycle
-gates, not a cryptographically authorized remote directory command. No new MCP,
-CLI, network route, service, signing authority, persistent scanner or apply path.
-Non-Windows must return an explicit unsupported error, not a path-based fallback.
+gates, not a cryptographically authorized remote directory command. No new MCP, network route, service, signing authority, persistent scanner or apply path.
+The separate `fleet-dir` CLI exposes these local observations only. Other platforms
+return explicit unsupported errors. Linux uses O_PATH/openat and validated regular
+FD procfs reads; it does not inherit Windows deny-delete handle semantics. See
+[Linux native evidence](../verification/linux-fleet-manifest-scan.md).
 
 ## Safety and bounds
 
 - Use the existing registry then filesystem gate lock order, with no SQLite lock.
-- Retain native ordinary ancestor/directory handles (deny delete, no reparse)
-  throughout enumeration. Check current object IDs before/after content reads.
+- Retain native ordinary ancestor/directory handles throughout enumeration. Windows
+  denies delete and rejects reparse points; Linux directory FDs do not prevent
+  ancestor rename. Check current object IDs before/after content reads.
 - Reject symlink/junction/reparse, special objects, non-UTF8 names and multi-link
   files. Use exact names, never lossy conversion, case-fold or Unicode merging.
 - Reuse logical manifest path validation; reserved fleet names fail, not skip.
@@ -32,8 +35,12 @@ Non-Windows must return an explicit unsupported error, not a path-based fallback
 The result describes a sequential read, not an atomic tree/file snapshot. Same
 Runtime mutations serialize, but external/mapped writers are not excluded.
 Metadata/identity rechecks detect some changes, not all possible concurrent edits.
-The returned namespace remains ExactUtf8Unqualified: reading real Windows names
+The returned namespace remains ExactUtf8Unqualified: reading real native names
 does not prove they are distinct/valid on a different target or volume.
 
-The first bounded whole-manifest reader is not pagination, exclusions, update
-publication, restart resume, operational sync_dir or production-scale acceptance.
+The original whole-manifest reader remains the default. The explicit filtered
+Runtime API now adds exact-subtree rules; `ManifestPages` adds session-MAC-bound
+metadata paging and `fleet-dir` exposes local scan/dry-run. These retain the whole
+bounded manifest in memory; they are not remote scan authority, update publication,
+restart resume, operational sync_dir or production-scale acceptance. See
+[the current entry contract](../verification/windows-fleet-directory-entry.md).

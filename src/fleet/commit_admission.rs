@@ -4,10 +4,10 @@
 use super::*;
 use crate::fleet::journal::Journal;
 use std::sync::TryLockError;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[path = "owned_publish.rs"]
 mod owned_publish;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub use owned_publish::{FinishedCandidate, ReceiptedCandidate, RenamedCandidate};
 
 pub(super) fn no_wait<T>(

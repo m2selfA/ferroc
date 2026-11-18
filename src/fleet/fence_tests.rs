@@ -38,7 +38,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
 fn spec(path: &Path) -> JobSpec {
     let root = path.parent().unwrap();
     JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: Uuid::from_bytes([1; 16]),
         source_device: device_digest("source-A").unwrap(),
         target_device: device_digest("target-B").unwrap(),
@@ -49,6 +49,7 @@ fn spec(path: &Path) -> JobSpec {
         bytes_total: 3,
         sha256: Sha256::digest(b"abc").into(),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: "native-fence".into(),

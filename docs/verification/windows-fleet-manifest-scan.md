@@ -15,7 +15,9 @@ Policy canonicalization could hide an in-policy junction.
 Budget: manifest100000 entries/16MiB aggregate logical paths, depth128, default
 64MiB hashed bytes, hard1GiB; content reads at most64KiB. Global name count includes
 ancestor queues. Errors/cancellation return no partial manifest and never write,
-delete, clean up or release transfer debt. No exclusions or pagination yet.
+delete, clean up or release transfer debt. The historical no-rules probe below
+remains unchanged; explicit exact-subtree rules, bounded metadata pages and local
+CLI were added later: [directory entry](windows-fleet-directory-entry.md).
 
 ## Native tests
 

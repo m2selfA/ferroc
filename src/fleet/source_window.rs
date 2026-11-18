@@ -12,7 +12,7 @@ use super::{
     source::AwaitingCommit,
     source_file::SourceFile,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::collections::VecDeque;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +29,10 @@ pub enum ProgressOutcome {
     Duplicate,
     Stale,
     Status,
+    /// The peer agreed to a renewal at the boundary this side offered.
+    RenewAccepted,
+    /// The peer confirmed the relay adopted the successor and installed it.
+    RenewCommitted,
 }
 struct Pending {
     offset: u64,
@@ -58,17 +62,40 @@ pub struct SourceWindow<'r> {
     peer_contiguous: u64,
     peer_received: u64,
     last_ack_sequence: Option<u64>,
+    /// Pending renewal handshake, if one is in progress. Only one at a time, so
+    /// a peer cannot interleave two generations and confuse which is installed.
+    renewal: Option<RenewState>,
     faulted: bool,
 }
+/// Source-side view of one renewal handshake. It exists only between a drained
+/// boundary and the commit frame; a failure here leaves the OLD epoch installed.
+#[derive(Debug, Clone)]
+struct RenewState {
+    generation: u64,
+    next_authorization_id: uuid::Uuid,
+    next_key_epoch: uuid::Uuid,
+    drained_at: u64,
+    accepted: bool,
+}
 impl<'r> SourceWindow<'r> {
-    pub fn new(mut source: SourceFile<'r>, window_chunks: u8) -> Result<Self> {
+    pub fn new(source: SourceFile<'r>, window_chunks: u8) -> Result<Self> {
+        Self::build(source, window_chunks, false)
+    }
+    /// Explicit BOTH-proof original-File mode; never accepts a caller-built base.
+    /// No suffix reads before an authenticated identical ResumeReady agreement.
+    pub fn resuming(source: SourceFile<'r>, window_chunks: u8) -> Result<Self> {
+        Self::build(source, window_chunks, true)
+    }
+    fn build(mut source: SourceFile<'r>, window_chunks: u8, resumed: bool) -> Result<Self> {
         ensure!(
             (1..=WINDOW as u8).contains(&window_chunks),
             "invalid local flow window"
         );
         ensure!(
-            source.bytes_encoded() == 0,
-            "flow wrapper refuses already-used source"
+            source.bytes_encoded() == 0
+                && source.resumed_prefix_bytes().is_some() == resumed
+                && source.resume_base().is_some() == resumed,
+            "flow mode requires unused source with matching original live resume metadata"
         );
         source.flow_check()?;
         Ok(Self {
@@ -79,12 +106,16 @@ impl<'r> SourceWindow<'r> {
             peer_contiguous: 0,
             peer_received: 0,
             last_ack_sequence: None,
+            renewal: None,
             faulted: false,
         })
     }
     #[cfg(test)]
     pub(super) fn test_expire(&mut self) {
         self.source.test_expire();
+    }
+    pub(crate) fn resumed_prefix_bytes(&self) -> Option<u64> {
+        self.source.resumed_prefix_bytes()
     }
     pub fn bytes_encoded(&self) -> u64 {
         self.source.bytes_encoded()
@@ -116,6 +147,10 @@ impl<'r> SourceWindow<'r> {
     ) -> Result<()> {
         self.live()?;
         ensure!(
+            self.source.resume_base().is_none(),
+            "resume window does not rotate its approved base"
+        );
+        ensure!(
             self.negotiated.is_some(),
             "renewal requires negotiated READY"
         );
@@ -128,6 +163,96 @@ impl<'r> SourceWindow<'r> {
         // is scoped to one epoch and must not compare counters across sealers.
         self.last_ack_sequence = None;
         Ok(())
+    }
+    /// True only when the source can prove the rotation boundary: negotiated,
+    /// nothing cached, and the peer's acknowledged prefix equals what has been
+    /// encoded. No other point is safe, because cached ciphertext belongs to the
+    /// old epoch and would be rejected after rotation.
+    pub fn at_renewal_boundary(&self) -> bool {
+        self.source.resume_base().is_none()
+            && self.negotiated.is_some()
+            && self.pending.is_empty()
+            && self.peer_contiguous == self.source.bytes_encoded()
+    }
+    /// Open a renewal handshake at the current boundary and return the sealed
+    /// offer frame. Sealed under the CURRENT epoch, so an old-epoch-only peer
+    /// still authenticates it. Nothing is installed here.
+    pub fn begin_renewal(
+        &mut self,
+        next_authorization_id: uuid::Uuid,
+        next_key_epoch: uuid::Uuid,
+        generation: u64,
+    ) -> Result<Vec<u8>> {
+        self.live()?;
+        ensure!(
+            self.at_renewal_boundary(),
+            "renewal requires a drained acknowledged window"
+        );
+        ensure!(generation > 0, "renewal generation starts at 1");
+        ensure!(self.renewal.is_none(), "renewal handshake already open");
+        let drained_at = self.source.bytes_encoded();
+        let frame =
+            self.source
+                .seal_flow_control(ControlBody::RenewOffer(super::control::RenewOffer {
+                    next_authorization_id,
+                    next_key_epoch,
+                    generation,
+                }))?;
+        self.renewal = Some(RenewState {
+            generation,
+            next_authorization_id,
+            next_key_epoch,
+            drained_at,
+            accepted: false,
+        });
+        Ok(frame)
+    }
+    /// The peer agreed. Its `drained_at` must equal the boundary this side
+    /// opened at: a peer that accepted a different offset would install the new
+    /// epoch over bytes it never acknowledged.
+    pub fn renewal_accepted(&self) -> Option<u64> {
+        self.renewal
+            .as_ref()
+            .filter(|r| r.accepted)
+            .map(|r| r.drained_at)
+    }
+    /// Seal the commit frame under the OLD epoch, then install the successor.
+    /// Order matters: after `renew` the old sealer is gone, so a commit frame
+    /// sealed afterwards could not be read by a peer still on the old epoch.
+    pub fn commit_renewal(
+        &mut self,
+        g: ValidatedGrant,
+        k: EphemeralKey,
+        t: &Transcript,
+        a: &[u8; 64],
+        b: &[u8; 64],
+    ) -> Result<Vec<u8>> {
+        self.live()?;
+        let state = self
+            .renewal
+            .clone()
+            .context("no renewal handshake to commit")?;
+        ensure!(state.accepted, "renewal not accepted by the peer");
+        ensure!(
+            g.grant().binding.authorization_id == state.next_authorization_id
+                && g.grant().binding.key_epoch == state.next_key_epoch,
+            "commit grant is not the offered successor"
+        );
+        ensure!(
+            self.at_renewal_boundary() && self.source.bytes_encoded() == state.drained_at,
+            "renewal boundary moved since the offer"
+        );
+        let frame = self.source.seal_flow_control(ControlBody::RenewCommit(
+            super::control::RenewCommit {
+                next_authorization_id: state.next_authorization_id,
+                next_key_epoch: state.next_key_epoch,
+                generation: state.generation,
+                drained_at: state.drained_at,
+            },
+        ))?;
+        self.renew(g, k, t, a, b)?;
+        self.renewal = None;
+        Ok(frame)
     }
     pub fn is_faulted(&self) -> bool {
         self.faulted
@@ -155,10 +280,10 @@ impl<'r> SourceWindow<'r> {
         if self.pending.len() >= window {
             return Ok(WindowRecord::Backpressured);
         }
-        let offset = self.source.bytes_encoded();
+        let offset = self.source.next_data_offset();
         match self.source.next_record() {
             Ok(Some(frame)) => {
-                let end = self.source.bytes_encoded();
+                let end = self.source.next_data_offset();
                 self.pending.push_back(Pending {
                     offset,
                     end,
@@ -208,8 +333,26 @@ impl<'r> SourceWindow<'r> {
             PeerRecord::Duplicate { .. } => Ok(ProgressOutcome::Duplicate),
             PeerRecord::Control { header, message } => match message.body {
                 ControlBody::Ready(r) => {
+                    ensure!(
+                        self.source.resume_base().is_none(),
+                        "legacy READY cannot negotiate resumed source"
+                    );
                     ensure!(self.negotiated.is_none(), "fresh second READY not allowed");
                     self.negotiated = Some(self.local_window.min(r.window_chunks as usize));
+                    Ok(ProgressOutcome::Ready)
+                }
+                ControlBody::ResumeReady(r) => {
+                    ensure!(
+                        self.negotiated.is_none(),
+                        "fresh second resume READY not allowed"
+                    );
+                    ensure!(
+                        self.source.resume_base() == Some(&r.base),
+                        "resume READY differs from local BOTH-proof base"
+                    );
+                    self.negotiated = Some(self.local_window.min(r.window_chunks as usize));
+                    self.peer_contiguous = r.base.prefix_bytes;
+                    self.peer_received = r.base.prefix_bytes;
                     Ok(ProgressOutcome::Ready)
                 }
                 ControlBody::Ack(a) => {
@@ -222,7 +365,7 @@ impl<'r> SourceWindow<'r> {
                         "fresh ACK regressed coverage"
                     );
                     ensure!(
-                        a.received <= self.source.bytes_encoded(),
+                        a.received <= self.source.next_data_offset(),
                         "ACK exceeds encoded stream"
                     );
                     ensure!(
@@ -237,6 +380,41 @@ impl<'r> SourceWindow<'r> {
                     self.peer_received = a.received;
                     self.last_ack_sequence = Some(header.sequence);
                     Ok(ProgressOutcome::Advanced)
+                }
+                ControlBody::RenewAccept(accept) => {
+                    let state = self
+                        .renewal
+                        .as_mut()
+                        .context("RENEW_ACCEPT without an open offer")?;
+                    ensure!(
+                        accept.generation == state.generation
+                            && accept.next_authorization_id == state.next_authorization_id
+                            && accept.next_key_epoch == state.next_key_epoch,
+                        "RENEW_ACCEPT names a different successor"
+                    );
+                    ensure!(
+                        accept.drained_at == state.drained_at,
+                        "RENEW_ACCEPT agreed a different boundary"
+                    );
+                    ensure!(!state.accepted, "duplicate RENEW_ACCEPT");
+                    state.accepted = true;
+                    Ok(ProgressOutcome::RenewAccepted)
+                }
+                ControlBody::RenewCommitted(committed) => {
+                    ensure!(
+                        self.source.resume_base().is_none(),
+                        "resume window does not accept renewal confirmation"
+                    );
+                    let installed = self.source.current_binding();
+                    ensure!(
+                        committed.next_authorization_id == installed.authorization_id
+                            && committed.next_key_epoch == installed.key_epoch,
+                        "RENEW_COMMITTED names a different successor"
+                    );
+                    Ok(ProgressOutcome::RenewCommitted)
+                }
+                ControlBody::RenewOffer(_) | ControlBody::RenewCommit(_) => {
+                    anyhow::bail!("source window does not accept peer renewal frames")
                 }
                 // Authenticated STATUS still does not release window/completion.
                 ControlBody::Status(s) => {

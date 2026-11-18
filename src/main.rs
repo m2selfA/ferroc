@@ -31,6 +31,18 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// LOCAL fleet identity/peer/endpoint setup only (no transfer or network).
+    #[cfg(feature = "fleet-core")]
+    Fleet(ferroc::fleet::admin_cli::FleetArgs),
+    /// LOCAL read-only directory scan/checksum dry-run; no apply or network.
+    #[cfg(feature = "fleet-core")]
+    FleetDir(ferroc::fleet::directory_cli::DirectoryArgs),
+    /// LOCAL read-only fleet obligation view; no admission, release or network.
+    #[cfg(feature = "fleet-core")]
+    FleetInventory(ferroc::fleet::inventory_cli::InventoryArgs),
+    /// LOCAL explicit recovery of a STOPPED owner's absent allocation; no network.
+    #[cfg(feature = "fleet-core")]
+    FleetRelease(ferroc::fleet::release_cli::ReleaseArgs),
     /// Serve local MCP over newline-delimited JSON-RPC on stdio.
     Stdio,
     /// Native Rust relay preview: SQLite, OAuth/PKCE, remote MCP and Web admin.
@@ -43,6 +55,14 @@ enum Commands {
         db: PathBuf,
         #[arg(long, env = "FERROC_ADMIN_PASSWORD", hide_env_values = true)]
         admin_password: String,
+        /// Enable candidate setup control on existing /ws only (no DATA routes).
+        #[cfg(feature = "fleet-core")]
+        #[arg(long)]
+        fleet_setup: bool,
+        /// Explicit LOCAL DATA routing approvals on this same relay. No file authority.
+        #[cfg(feature = "fleet-core")]
+        #[arg(long, requires = "fleet_setup")]
+        fleet_data_config: Option<PathBuf>,
     },
     /// Print the implemented tool definitions (not the upstream full feature set).
     Tools,
@@ -78,7 +98,33 @@ enum Commands {
         /// Fail on first disconnect, useful for supervised execution and diagnostics.
         #[arg(long)]
         once: bool,
+        /// Explicit LOCAL setup provisioning (fleet-core builds only). Absent means
+        /// the stock agent: no capability flag and no setup backend.
+        #[cfg(feature = "fleet-core")]
+        #[arg(long, env = "FERROC_FLEET_SETUP")]
+        fleet_setup: Option<PathBuf>,
     },
+}
+
+/// Absent provisioning keeps the stock agent byte-identical in behaviour.
+async fn run_agent(
+    runtime: Arc<Runtime>,
+    creds: &transport::Credentials,
+    once: bool,
+    #[cfg(feature = "fleet-core")] fleet_setup: Option<PathBuf>,
+) -> Result<()> {
+    #[cfg(feature = "fleet-core")]
+    if let Some(path) = fleet_setup {
+        let provision = std::sync::Arc::new(ferroc::fleet::setup_config::SetupProvision::load(
+            &path,
+            &creds.device_id,
+        )?);
+        if provision.mcp_transfer_requested() {
+            runtime.open_fleet_mcp(provision.clone(), 8)?;
+        }
+        return transport::run_with_setup(runtime, creds, &provision, once).await;
+    }
+    transport::run(runtime, creds, once).await
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -118,6 +164,39 @@ async fn main() -> Result<()> {
     let is_relay = matches!(&cli.command, Commands::Relay { .. });
     let run = async {
         match cli.command {
+            #[cfg(feature = "fleet-core")]
+            Commands::Fleet(args) => {
+                ensure!(
+                    runtime.policy.allow_transfers,
+                    "fleet configuration disabled by --no-transfers"
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ferroc::fleet::admin_cli::run(args)?)?
+                );
+            }
+            #[cfg(feature = "fleet-core")]
+            Commands::FleetDir(args) => {
+                ferroc::fleet::directory_cli::run(&runtime, args, &mut std::io::stdout().lock())?;
+            }
+            #[cfg(feature = "fleet-core")]
+            Commands::FleetRelease(args) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ferroc::fleet::release_cli::run(
+                        &runtime, args
+                    )?)?
+                );
+            }
+            #[cfg(feature = "fleet-core")]
+            Commands::FleetInventory(args) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ferroc::fleet::inventory_cli::run(
+                        &runtime, args
+                    )?)?
+                );
+            }
             Commands::Tools => println!(
                 "{}",
                 serde_json::to_string_pretty(&ferroc::runtime::tools())?
@@ -128,7 +207,16 @@ async fn main() -> Result<()> {
                 public_url,
                 db,
                 admin_password,
+                #[cfg(feature = "fleet-core")]
+                fleet_setup,
+                #[cfg(feature = "fleet-core")]
+                fleet_data_config,
             } => {
+                #[cfg(feature = "fleet-core")]
+                let routes = fleet_data_config
+                    .as_deref()
+                    .map(ferroc::fleet::route_control::ApprovedDataRoutes::load)
+                    .transpose()?;
                 let relay = ferroc::relay::Relay::new(&db, &public_url, &admin_password)?;
                 let listener = tokio::net::TcpListener::bind(bind).await?;
                 eprintln!(
@@ -136,7 +224,17 @@ async fn main() -> Result<()> {
                     listener.local_addr()?
                 );
                 let shutdown = relay.clone();
-                axum::serve(listener, relay.router())
+                #[cfg(feature = "fleet-core")]
+                let router = if let Some(routes) = routes {
+                    relay.router_with_approved_routes(routes)
+                } else if fleet_setup {
+                    relay.router_with_setup()
+                } else {
+                    relay.router()
+                };
+                #[cfg(not(feature = "fleet-core"))]
+                let router = relay.router();
+                axum::serve(listener, router)
                     .with_graceful_shutdown(async move {
                         let _ = tokio::signal::ctrl_c().await;
                         shutdown.disconnect_all();
@@ -160,6 +258,8 @@ async fn main() -> Result<()> {
                 proxy: _,
                 no_proxy: _,
                 ca_cert: _,
+                #[cfg(feature = "fleet-core")]
+                fleet_setup,
             } => {
                 eprintln!(
                     "agent outbound network: {}",
@@ -198,12 +298,24 @@ async fn main() -> Result<()> {
                     transport::relay_url(&saved.relay_url)?;
                     saved
                 } else {
+                    #[cfg(feature = "fleet-core")]
+                    ensure!(
+                        fleet_setup.is_none(),
+                        "--fleet-setup requires existing paired credentials; pair without setup first"
+                    );
                     let relay =
                         relay.context("no saved credentials; specify --relay <HTTPS URL>")?;
                     transport::pair_with_network(&relay, &name, &path, &runtime.policy.network)
                         .await?
                 };
-                transport::run(runtime.clone(), &creds, once).await?;
+                run_agent(
+                    runtime.clone(),
+                    &creds,
+                    once,
+                    #[cfg(feature = "fleet-core")]
+                    fleet_setup,
+                )
+                .await?;
             }
         }
         Ok::<_, anyhow::Error>(())

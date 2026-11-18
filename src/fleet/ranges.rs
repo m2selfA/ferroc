@@ -29,6 +29,18 @@ impl ReceiveRanges {
             pending: BTreeMap::new(),
         })
     }
+    /// Recovery constructor: coverage STARTS at a verified prefix. Only the
+    /// contiguous prefix may be pre-registered (no pending gaps); DATA then
+    /// continues strictly AFTER the prefix. NOT a resume guarantee.
+    pub fn with_verified_prefix(total: u64, prefix: u64) -> Result<Self> {
+        ensure!(total <= MAX_FILE_BYTES, "file exceeds fleet limit");
+        ensure!(prefix <= total, "verified prefix exceeds declared file");
+        Ok(Self {
+            total,
+            contiguous: prefix,
+            pending: BTreeMap::new(),
+        })
+    }
     /// Validate BEFORE disk IO. Old records already below the contiguous prefix
     /// must be deduplicated by the authenticated record opener, not rewritten.
     pub fn validate(&self, offset: u64, len: u32, digest: &[u8; 32]) -> Result<Admission> {

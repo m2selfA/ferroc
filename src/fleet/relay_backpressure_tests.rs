@@ -435,3 +435,7 @@ async fn actual_v9_settlement_survives_failed_native_final_ack_without_source_co
         .unwrap();
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "relay_eof_tests.rs"]
+mod eof_tests;

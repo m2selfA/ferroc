@@ -4,7 +4,7 @@ use crate::{
     fleet::{
         job::RoutePolicy,
         protocol::device_digest,
-        stage::{StageBudget, StageFile},
+        stage::{ParentSync, PublishMode, StageBudget, StageFile},
     },
 };
 use sha2::{Digest, Sha256};
@@ -28,7 +28,7 @@ fn db(path: &Path) -> Connection {
 }
 fn job(root: &Path) -> JobSpec {
     JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: Uuid::from_bytes([1; 16]),
         source_device: device_digest("source-A").unwrap(),
         target_device: device_digest("target-B").unwrap(),
@@ -39,6 +39,7 @@ fn job(root: &Path) -> JobSpec {
         bytes_total: 3,
         sha256: Sha256::digest(b"abc").into(),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: "journal-case".into(),
@@ -63,6 +64,7 @@ fn published() -> Publication {
         size: 3,
         sha256: Sha256::digest(b"abc").into(),
         parent_sync: ParentSync::Unsupported,
+        mode: PublishMode::CreateNoClobber,
     }
 }
 #[test]
@@ -313,7 +315,8 @@ fn uncertain_publication_and_mismatched_receipt_never_complete() {
             Publication::Published {
                 size: 4,
                 sha256: job(t.path()).sha256,
-                parent_sync: ParentSync::Unsupported
+                parent_sync: ParentSync::Unsupported,
+                mode: PublishMode::CreateNoClobber,
             }
         )
         .is_err()

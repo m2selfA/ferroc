@@ -18,6 +18,8 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostMode {
     Paused,
+    /// Explicit retained-stage admissions only; ordinary fresh work stays closed.
+    RecoveryOnly,
     Running,
     Closing,
     Closed,
@@ -67,6 +69,9 @@ pub(crate) struct HostRegistration {
     pub(crate) attached: bool,
     pub(crate) stopped: bool,
     pub(crate) control: std::sync::Weak<HostControl>,
+    pub(crate) tasks: Option<super::transfer_tasks::TransferTasks>,
+    pub(crate) setup: std::sync::Weak<super::setup_agent::SetupControl>,
+    pub(crate) mcp: Option<std::sync::Arc<super::mcp_transfer::McpTransfer>>,
 }
 // Shared lifecycle only, not DB ownership; Runtime holds just a Weak registration.
 pub(crate) struct HostControl {
@@ -74,6 +79,18 @@ pub(crate) struct HostControl {
     idle: Arc<Condvar>,
 }
 impl HostControl {
+    /// Terminally reject new host operations without waiting on live owners.
+    /// Runtime uses this BEFORE cancelling/draining its owned task futures.
+    pub(crate) fn stop_admission(&self) -> Result<()> {
+        let mut state = self
+            .control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host control poisoned"))?;
+        if state.mode != HostMode::Closed {
+            state.mode = HostMode::Closing;
+        }
+        Ok(())
+    }
     pub(crate) fn stop_and_drain(&self) -> Result<()> {
         let mut state = self
             .control
@@ -179,11 +196,48 @@ impl<'r> FleetHost<'r> {
             attachment,
         })
     }
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn runtime(&self) -> &Runtime {
+        self.attachment.runtime
+    }
     pub fn status(&self) -> Result<HostStatus> {
         Ok(*self
             .control
             .lock()
             .map_err(|_| anyhow::anyhow!("host control poisoned"))?)
+    }
+    /// Explicit LOCAL operator selection. Does not forgive debt or permit
+    /// ordinary fresh admissions, and does not authenticate a recovery itself.
+    pub fn resume_retained_recovery(&self) -> Result<()> {
+        ensure!(
+            self.attachment.runtime.policy.allow_transfers,
+            "transfers disabled by local policy"
+        );
+        let mut state = self
+            .control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host control poisoned"))?;
+        ensure!(
+            !matches!(state.mode, HostMode::Closing | HostMode::Closed),
+            "fleet host closing or closed"
+        );
+        state.mode = HostMode::RecoveryOnly;
+        Ok(())
+    }
+    fn enter_recovery(&self) -> Result<Operation<'_, 'r>> {
+        let mut state = self
+            .control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host control poisoned"))?;
+        ensure!(
+            state.mode == HostMode::RecoveryOnly,
+            "fleet host not in explicit recovery-only mode"
+        );
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .context("host operation count overflow")?;
+        Ok(Operation { host: self })
     }
     fn enter(&self, admission: bool) -> Result<Operation<'_, 'r>> {
         let mut state = self
@@ -232,10 +286,36 @@ impl<'r> FleetHost<'r> {
     /// every admission again verifies the fixed limits and persistent obligations.
     pub fn resume(&self) -> Result<()> {
         let report = self.inventory()?;
-        ensure!(
-            report.complete() && report.recorded_usage() == (0, 0),
-            "unresolved inventory/debt blocks host admission"
-        );
+        if !report.complete() || report.recorded_usage() != (0, 0) {
+            // Actionable, bounded diagnostics: counts and finding KINDS only, never
+            // a path, digest or peer detail. The operator still needs
+            // `fleet-inventory` to see the rows and `fleet-release` to retire one.
+            let (bytes, slots) = report.recorded_usage();
+            let kinds: Vec<&str> = report
+                .findings()
+                .iter()
+                .map(|f| match f.kind {
+                    super::inventory::FindingKind::AnonymousStageUnobservable => {
+                        "anonymousStageUnobservable"
+                    }
+                    super::inventory::FindingKind::ForeignControl => "foreignControl",
+                    super::inventory::FindingKind::ScopeUnavailable => "scopeUnavailable",
+                    super::inventory::FindingKind::MissingStage => "missingStage",
+                    super::inventory::FindingKind::UnsafeStage => "unsafeStage",
+                    super::inventory::FindingKind::OversizedStage => "oversizedStage",
+                    super::inventory::FindingKind::ScanLimit => "scanLimit",
+                    super::inventory::FindingKind::QuotaExceeded => "quotaExceeded",
+                    _ => "other",
+                })
+                .collect();
+            anyhow::bail!(
+                "unresolved inventory/debt blocks host admission: complete={} reservedBytes={} slots={} findings={:?}; inspect with `ferroc fleet-inventory`",
+                report.complete(),
+                bytes,
+                slots,
+                kinds
+            );
+        }
         ensure!(
             self.attachment.runtime.policy.allow_transfers,
             "transfers disabled by local policy"
@@ -378,6 +458,11 @@ impl<'r> FleetHost<'r> {
     pub fn get(&self, key: &JobKey) -> Result<Option<Snapshot>> {
         self.with_database(false, |db| db.journal()?.get(key))
     }
+    /// Read-only: every persisted obligation row. No admission, release, stage
+    /// creation or publication; callers still need the real fence/database.
+    pub fn obligations(&self) -> Result<Vec<Snapshot>> {
+        self.with_database(false, |db| db.journal()?.rows())
+    }
     pub fn inventory(&self) -> Result<RecoveryInventory> {
         self.with_database(false, |db| {
             db.inventory(
@@ -395,6 +480,49 @@ impl<'r> FleetHost<'r> {
     /// Actual release still verifies persisted DB+parent domain and original owner.
     pub fn recover_stopped_owner(&self, stopped: Uuid) -> Result<Vec<Snapshot>> {
         self.with_database(false, |db| db.journal()?.recover_stopped_owner(stopped))
+    }
+    /// Explicit LOCAL stopped-owner selection under this host's exclusive native
+    /// DB fence. Only the exact retained precommit row is taken over; unrelated
+    /// obligations stay unchanged. This never constructs StoppedCreators, releases
+    /// debt or returns an IO owner. Caller must independently know the old process
+    /// has stopped; PID/timeout/UUID alone is not that evidence. BOTH recovery
+    /// proofs and original-object readback remain required by receiver admission.
+    pub fn recover_retained_job(
+        &self,
+        key: &JobKey,
+        stopped: Uuid,
+        revision: u64,
+    ) -> Result<Snapshot> {
+        let _operation = self.enter_recovery()?;
+        let mut guard = self
+            .database
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host database poisoned"))?;
+        let db = guard.as_mut().context("host database closed")?;
+        db.fence.check_connection(&db.connection)?;
+        let row = db.journal()?.recover_retained_job(key, stopped, revision)?;
+        db.fence.check_connection(&db.connection)?;
+        Ok(row)
+    }
+    /// Read-only verification of the selected recovered prefix. Still not an IO
+    /// capability: receiver admission repeats this against its live typed lease.
+    pub fn inspect_retained_checkpoint(
+        &self,
+        key: &JobKey,
+        max_prefix_bytes: u64,
+    ) -> Result<super::checkpoint_readback::CheckpointReadback> {
+        let _operation = self.enter_recovery()?;
+        let mut guard = self
+            .database
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host database poisoned"))?;
+        let db = guard.as_mut().context("host database closed")?;
+        db.inspect_retained_checkpoint(
+            key,
+            &self.attachment.runtime.policy,
+            self.gate.clone(),
+            max_prefix_bytes,
+        )
     }
     pub fn inspect_allocation(&self, key: &JobKey) -> Result<Reconciliation> {
         self.with_database(false, |db| {

@@ -31,6 +31,11 @@ struct Args {
     no_proxy: bool,
     #[arg(long, env = "FERROC_CA_CERT", hide_env_values = true)]
     ca_cert: Option<PathBuf>,
+    /// Local fleet approval file. With transfer.mcp=true, exposes four task tools
+    /// over the GUI HTTP MCP endpoint. Requires a configured relay.
+    #[cfg(feature = "fleet-core")]
+    #[arg(long, env = "FERROC_FLEET_SETUP", hide_env_values = true)]
+    fleet_setup: Option<PathBuf>,
     #[arg(long, env = "FERROC_HOME")]
     home: Option<PathBuf>,
     #[arg(long, default_value = "ferroc")]
@@ -433,6 +438,8 @@ pub fn run() -> Result<()> {
         relay: args.relay.clone(),
         home,
         name: args.name,
+        #[cfg(feature = "fleet-core")]
+        fleet_setup: args.fleet_setup.clone(),
     };
     let input = Inputs {
         root: signal(args.allow_dir.display().to_string()),
@@ -550,7 +557,16 @@ pub fn run() -> Result<()> {
                     .unwrap_or_else(|| "启动后显示本机地址".into()),
             );
             network.set(format!("代理：{}", snapshot.network));
-            relay_status.set(format!("中继：{}", snapshot.relay));
+            let relay_text = format!("中继：{}", snapshot.relay);
+            #[cfg(feature = "fleet-core")]
+            let relay_text = match &snapshot.fleet_tasks {
+                Some(tasks) => format!(
+                    "{relay_text} · 本机任务：{}待完成 / {}对端报告完成 / {}中断 / {}失败",
+                    tasks.pending, tasks.peer_reported_completed, tasks.interrupted, tasks.failed,
+                ),
+                None => relay_text,
+            };
+            relay_status.set(relay_text);
             detail.set(snapshot.detail.clone());
             start_text.set(
                 if snapshot.has_runtime {

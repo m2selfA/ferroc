@@ -39,6 +39,10 @@ impl ClockSample {
             wall: SystemTime::now(),
         }
     }
+    pub(crate) fn local_epoch_ms(&self) -> Result<u64> {
+        u64::try_from(self.wall.duration_since(std::time::UNIX_EPOCH)?.as_millis())
+            .context("local epoch overflow")
+    }
     #[cfg(test)]
     pub(super) fn shifted(self, mono: Duration, wall: Duration) -> Self {
         Self {
@@ -422,6 +426,12 @@ impl LeasedRecords {
     /// This is not a reusable permit nor an implementation of that IO boundary.
     pub fn check_commit_admission(&mut self) -> Result<()> {
         self.clock.check(Kind::Finish, ClockSample::now())?;
+        ensure!(!self.records.is_faulted(), "fleet record session faulted");
+        Ok(())
+    }
+    /// Read-only observation admission: preserve ACK/status after mutation expiry.
+    pub(super) fn check_observation_admission(&mut self) -> Result<()> {
+        self.clock.check(Kind::StatusRequest, ClockSample::now())?;
         ensure!(!self.records.is_faulted(), "fleet record session faulted");
         Ok(())
     }

@@ -521,7 +521,8 @@ fn unsupported_future_receipt_cannot_clear_v7_stage_debt() {
             crate::fleet::stage::Publication::Published {
                 size: 3,
                 sha256: s.job().sha256,
-                parent_sync: crate::fleet::stage::ParentSync::Unsupported
+                parent_sync: crate::fleet::stage::ParentSync::Unsupported,
+                mode: crate::fleet::stage::PublishMode::CreateNoClobber,
             }
         )
         .is_err()

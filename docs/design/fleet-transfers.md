@@ -1,6 +1,6 @@
 # ferroc fleet 内机器互传实现规划
 
-> **状态：用户要求停止 Advisor 咨询并继续实现；P0 原语保留既有证据，P1 已开始源文件 IO 候选，网络通道尚未接入，未提交/未推送。** 起始默认沿用本设计，工具名仍不是已可调用接口。新增候选格式及明确缺口见 [P0 core](fleet-p0-core.md)。
+> **当前状态（2026-11-16）：** relay-only预批准文件传输、四个MCP任务工具、Windows/Linux本机scan/dry-run/精确排除/owner绑定分页已有实现，Windows与XFS各有真实10万文件扫描证据（非网络apply）。Linux显式O_TMPFILE原FD无覆盖接收已接入活跃lease/journal/v9收据；新release已过真实glibc2.17容器MCP25读写和两机0B至128MiB双端完整收据/SQL/SHA核验。新Linux1GiB目标已结算而Source失败，不能报双端成功；旧公网TLS128MiB的300s失败独立保留，新公网TLS仅3B/8MiB闭环。Linux显式父目录创建已实现并独立验证；Linux覆盖、通用远程目录审批/apply、空目录/删除、重启续传、QUIC/NAT及生产交付仍缺。具体分层证据见[Linux接收记录](../verification/linux-fleet-receiver.md)，不能把组件/扫描/SSH转发和公网或生产资格混用。
 >
 > 基线：ferroc `02e5842`；参考源码、固定提交与证据分层见 [研究报告](../research/remote-agents-mcp-fleet.md)。不计划与 remote-agents-mcp wire 兼容。
 
@@ -132,20 +132,22 @@ fleet 工具属于**coordinator 层**，不冒充 agent 25 工具或 text `read_
 |---|---|---|
 | P0 原语工程 | 双签/控制/本机续租/保护身份/fenced journal/清点/活跃 v9 结算/发送端 ACK 观察已有本地回归 | 不再当作全部未实现；工程通过不等于运行资格 |
 | 历史独立源码复核 | 未取得有效独立签收；用户明确停止 Advisor 咨询 | 不再作为开发依赖，不伪称签收、不改插件权限；继续按实际代码和测试推进 |
-| 当前平台资格 52 | 本机 WSL stub 报未安装，Docker/Podman CLI 缺失；没有本轮 Linux 原生证明 | 等待可用且明确授权的执行面，不擅选 SSH 或安装服务 |
-| P1 源 IO / 流控 / 真实传输 | 已接入同 relay 候选 route 与 IO pump，真实 relay/Source/Target 三测试进程初验通过；仍无生产 MCP/CLI 入口 | 显式 router_with_fleet，固定公开测试签发，不能冒充运营注册、两机或 Linux/生产验收 |
-| 获准并行纯 manifest/diff | 默认 checksum、quick 任意 mtime 差异、冲突子树阻断、目标额外项保留；10万内存条目验证 | 仅 dry-run 描述，不证明实际文件树、名称等价或 IO |
-| P2 扫描与 apply | Windows本机有界扫描候选已实现：Policy/Runtime内真实目录与64KiB哈希，ReadSequence不是快照。另有只读目标预检：父目录须已存在且私有、解析后仍在目标根内、ASCII可移植名称剖面、目标缺失，并按有序计划摘要绑定；不建目录/不建文件/不覆盖。运营每文件授权和更新事务仍未完成 | 无远程扫描授权/分页/排除；预检不是发布许可或快照，无删除/apply，见[fleet-manifest-scan](fleet-manifest-scan.md)与[fleet-target-preflight](fleet-target-preflight.md) |
+| Linux 兼容性 | 新接收 release ELF `88a063a6…80ef3b` 已通过静态 GLIBC<=2.17 和固定摘要 manylinux2014 中的 initialize/MCP25/读写；实际运行 image 哈希逐进程核验 | 同一新 ELF 的资格不继承给其他构建；完整 Linux 矩阵单独记账，非全文件系统/旧内核/生产资格 |
+| P1 文件传输与四工具 | 预批准 round MCP、独立身份/固定本机时间锚、DATA 原 owner 已接通；新公网TLS3B/8MiB完整双端收据通过；新Linux release两机0B至128MiB全字段核验通过 | 新Linux1GiB目标Completed/SQL与SHA相等，但Source receive failed且无完成观察，不能算双端成功；旧公网128MiB300s失败独立保留；非任意路径授权 |
+| P2 manifest/diff | checksum 默认、quick 任意 mtime 差异、冲突阻断、保留目标额外项；真实100000文件/100页扫描已验，另有99900文件+100目录嵌套树 | ReadSequence不是快照；10万真实扫描不等于10万文件网络apply |
+| P2 目录扫描与 apply | Windows/Linux本机scan/dry-run、精确子树排除、有界分页/owner绑定游标、Windows/Linux只读预检（含本机CLI `fleet-dir preflight`）、显式私密父目录与v10覆盖已实现；人工预批准两文件apply已有本机证据 | MCP sync_dir仍是顺序预批准批次；通用远程扫描/审批/apply、空目录同步、Linux覆盖和大树网络apply仍缺；Linux显式父目录另有独立验收；不删除 |
+| P3 QUIC/NAT | relay-only 是当前实际路线 | 认证 QUIC、候选/STUN、路径计数/切路、UDP/NAT 及回落矩阵均未实现 |
+| P4 与扩展需求 | MCP 候选与部分 Linux ABI/容器证据已存在 | GUI/HTTP 统一 fleet 入口、tag fleet 交付、独立复核、时钟/部署仍缺；重启续传不在首版承诺内，若按扩展需求实施仍未实现 |
 
 
 大数据最终门槛：逐步增加至可供使用的实际生产目录/EMPIAR 数据，不预设本机已拥有某数据集。记录数据集来源、完整 manifest/端点 SHA、二进制SHA↔commit、明确强制路线与实际路线字节、峰值内存、磁盘/网络指标和失败恢复日志；分节点/二进制/数据集独立存档。合成小测试和回环 QUIC 不能代替真实公网/生产级验收。
 
 ## 11. 下一步建议与仍待签收的选择
 
-先做 **P0 审阅 + P1 relay-only 单文件**，不要先调 NAT 或做 GUI进度条。可并行细化纯 manifest/diff 测试，但共享 wire/身份/事务合同先冻结。现有 tag-only CI 首次执行和既有 GUI 真人验收仍是原来的独立事项，不能被本研究标成通过。
+继续按目标扫荡推进：Linux无覆盖接收及两机128MiB已闭合，Linux显式父目录已实现；下一批是Linux覆盖、通用远程目录审批与apply、空目录、最终ACK交付、P3及P4。新Linux1GiB仅目标结算，Source接收失败的底层WS原因尚未定位；不能从300s上限或静态关闭竞态推断本轮根因。旧公网TLS128MiB耗尽300s与低速TLS对照保留独立来源。真实系统时间与各自固定本机授权区间继续保留；不使用时钟shim、不放宽路由/IO硬边界、不拿旧二进制结果认证新构建。GUI真人验收、tag-only交付与生产数据/时钟纪律仍是独立事项。
 
 建议初始选择：原生 relay 同管理域限定；fleet 本地 opt-in；checksum 默认；dry-run 默认；删除默认禁用；显式代理默认不 UDP 绕行；无进程重启续传承诺。用户已批准以这些起始默认推进；具体 wire、身份、授权和事务合同仍须完成 P0 独立复核后冻结，不意味着现已上线。
 
-研究阶段已完成源码与隔离算法对照；default-off `fleet-core` 已有控制体/双签、受保护身份/pin、本机续租、fenced SQLite journal/幂等、清点恢复及 v9 本地结算/发送端 ACK 观察的工程验证。它们仍未独立签收；源文件读取、有界流控和同relay候选网络生命周期已经接入组件，但不等于运营注册、签发或两机部署。**P0 整体验收、生产入口、全程序网络测试和有效独立签收不能由这些组件替代。** 历史独立签收和真实平台资格仍未获得；用户已明确停止 Advisor 咨询，复核根不再阻塞开发。源 IO/流控/relay+A+B 按原 P1 路线继续实现，不再不断新增 P0 前置条件；当前源 IO 见[候选合同](fleet-source-io.md)。
+实现已超过研究期的纯组件阶段：显式 stock agent、受保护本机身份/peer/端点批准、setup/leased owner、独立 DATA ticket、文件泵与四工具已接线；具体当前合同见 [MCP runtime](fleet-mcp-runtime.md)。它们仍不等于运营任意路径签发、完整目录同步或生产部署资格。历史独立签收缺失如实保留，但不再作为开发前置。
 
-按本节允许的并行路线，新增纯逻辑 `manifest::diff`：checksum 默认；quick 使用 size 或任何 mtime 差异，不再只比较源端更新；额外目标只保留，文件/目录冲突阻断子树。结果仅是整文件变化的 dry-run 描述，没有扫描/apply/覆盖/删除权限；ExactUtf8Unqualified 不证明 Windows 名称或文件对象互不冲突。10万条内存清单实验不能替代 P2 的实际10万文件树、跨平台命名或网络同步验收；P0/P1/P2 均未因此签收。
+`manifest::diff` 仍是纯逻辑组件；Windows/Linux 扫描和 Windows 预批准 add/replace apply 已有各自本机证据，不能由此宣称通用远程目录接口。ExactUtf8Unqualified 不证明跨平台文件名或对象等价，10万内存条目仍不能替代真实大树。原计划与后续扩展需求中的 Linux sink、QUIC/NAT、重启续传、删除/改名及 Windows 父目录耐久性均须按各自实现和实测验收，不因上述进展自动关闭。

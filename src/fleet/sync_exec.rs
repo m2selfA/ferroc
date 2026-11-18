@@ -3,18 +3,25 @@
 //! requires both sides to report the SAME receipt. No retry, reconnect, journal,
 //! operational issuance or two-host orchestration. The candidate driver owns
 //! sequential scheduling only; callers still construct all authorized owners.
+use super::control::Receipt;
+#[cfg(windows)]
 use super::{
-    control::Receipt,
     host::receiver::HostReceiver,
-    relay_io::{FleetLink, run_source, run_target},
+    relay_io::{FleetLink, run_source},
     source_window::SourceWindow,
     sync_plan::SyncPlan,
     sync_run::{RunLedger, RunStatus},
 };
-#[cfg(test)]
+// The Target publish/settle sink is Windows-only today, so the functions that
+// drive it are gated rather than the whole module: CancelToken and ExecOutcome
+// are platform-neutral and are used by the manifest scanner and preflight.
+#[cfg(windows)]
+use super::relay_io::run_target;
+#[cfg(all(test, windows))]
 #[path = "sync_exec_tests.rs"]
 mod tests;
 
+#[cfg(windows)]
 use anyhow::{Result, ensure};
 use std::sync::{
     Arc,
@@ -38,7 +45,7 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         while !self.is_cancelled() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -69,6 +76,7 @@ pub enum ExecOutcome {
 /// ```compile_fail
 /// fn no_receipt_kind(o:ferroc::fleet::sync_exec::ExecOutcome){let _:ferroc::fleet::control::Receipt=o;}
 /// ```
+#[cfg(windows)]
 pub async fn execute_file_cancellable(
     window: SourceWindow<'_>,
     source: FleetLink,
@@ -89,6 +97,7 @@ pub async fn execute_file_cancellable(
 }
 /// Everything one planned file needs, built by the caller (links, admission and
 /// records all stay caller-owned). `run_plan` never constructs them itself.
+#[cfg(windows)]
 pub struct PreparedFile<'a> {
     pub window: SourceWindow<'a>,
     pub source: FleetLink,
@@ -104,6 +113,7 @@ pub struct PreparedFile<'a> {
 /// ```compile_fail
 /// fn no_skip(plan:&ferroc::fleet::sync_plan::SyncPlan,l:&mut ferroc::fleet::sync_run::RunLedger){let _=ferroc::fleet::sync_exec::run_plan(plan,l,3);}
 /// ```
+#[cfg(windows)]
 pub async fn run_plan<'a, F, Fut>(
     plan: &SyncPlan,
     ledger: &mut RunLedger,
@@ -177,6 +187,7 @@ where
     }
     Ok(ledger.status())
 }
+#[cfg(windows)]
 pub async fn execute_file(
     window: SourceWindow<'_>,
     source: FleetLink,

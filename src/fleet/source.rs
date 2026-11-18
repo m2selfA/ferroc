@@ -36,6 +36,7 @@ pub struct SourceEncoder {
     records: LeasedRecords,
     hash: Sha256,
     bytes_encoded: u64,
+    resume_prefix: Option<u64>,
     faulted: bool,
 }
 impl SourceEncoder {
@@ -45,6 +46,7 @@ impl SourceEncoder {
             records,
             hash: Sha256::new(),
             bytes_encoded: 0,
+            resume_prefix: None,
             faulted: false,
         })
     }
@@ -54,6 +56,9 @@ impl SourceEncoder {
     #[cfg(test)]
     pub(super) fn test_expire(&mut self) {
         self.records.test_expire();
+    }
+    pub(super) fn current_grant(&self) -> &ValidatedGrant {
+        self.records.grant()
     }
     pub(super) fn io_chunk_bytes(&self) -> usize {
         self.records.grant().grant().chunk_bytes as usize
@@ -69,6 +74,13 @@ impl SourceEncoder {
     pub(super) fn flow_faulted(&self) -> bool {
         self.faulted
     }
+    pub(super) fn current_binding(&self) -> super::protocol::Binding {
+        self.records.grant().grant().binding.clone()
+    }
+    pub(super) fn seal_flow_control(&mut self, body: ControlBody) -> Result<Vec<u8>> {
+        ensure!(!self.faulted, "source encoder faulted");
+        self.records.seal_control(body)
+    }
     pub(super) fn open_flow_control(&mut self, bytes: &[u8]) -> Result<PeerRecord> {
         self.check_source_io()?;
         let result = self.records.open_record(bytes);
@@ -78,16 +90,37 @@ impl SourceEncoder {
         self.check_source_io()?;
         result
     }
+    /// NEW suffix DATA bytes encoded by this owner; excludes any restored prefix.
     pub fn bytes_encoded(&self) -> u64 {
         self.bytes_encoded
+    }
+    pub fn resumed_prefix_bytes(&self) -> Option<u64> {
+        self.resume_prefix
+    }
+    /// Logical next DATA offset, not a traffic/durability/current-file counter.
+    pub fn next_data_offset(&self) -> u64 {
+        self.resume_prefix.unwrap_or(0) + self.bytes_encoded
+    }
+    pub(super) fn restore_prefix(&mut self, hash: Sha256, bytes: u64) -> Result<()> {
+        self.check_source_io()?;
+        ensure!(
+            self.resume_prefix.is_none()
+                && self.bytes_encoded == 0
+                && bytes <= self.job().bytes_total
+                && self.records.grant().lease_profile() == super::job::LeaseProfile::SingleOwner,
+            "source prefix seed requires fresh SingleOwner state"
+        );
+        self.hash = hash;
+        self.resume_prefix = Some(bytes);
+        Ok(())
     }
     /// Seal next ordered chunk; cache exact returned bytes for retransmission.
     /// A failed crypto/lease call closes this encoder; validation-only errors do
     /// not advance count/hash. The component retains no DATA queue.
     pub fn encode_next(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
         ensure!(!self.faulted, "source encoder faulted");
-        let end = self
-            .bytes_encoded
+        let offset = self.next_data_offset();
+        let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| anyhow::anyhow!("source byte count overflow"))?;
         ensure!(
@@ -96,7 +129,7 @@ impl SourceEncoder {
                 && end <= self.job().bytes_total,
             "source chunk empty/oversized/beyond approved total"
         );
-        let frame = match self.records.seal_data(self.bytes_encoded, bytes) {
+        let frame = match self.records.seal_data(offset, bytes) {
             Ok(frame) => frame,
             Err(e) => {
                 self.faulted = true;
@@ -105,7 +138,7 @@ impl SourceEncoder {
             }
         };
         self.hash.update(bytes);
-        self.bytes_encoded = end;
+        self.bytes_encoded += bytes.len() as u64;
         Ok(frame)
     }
     pub fn revoke(&mut self) {
@@ -129,11 +162,11 @@ impl SourceEncoder {
     /// target commit. Returned owner caches one immutable FINISH for retries.
     pub fn finish(self) -> Result<AwaitingCommit> {
         ensure!(
-            !self.faulted && self.bytes_encoded == self.job().bytes_total,
+            !self.faulted && self.next_data_offset() == self.job().bytes_total,
             "source FINISH needs full encoded coverage"
         );
         let expected = self.job().sha256;
-        let total = self.bytes_encoded;
+        let total = self.next_data_offset();
         let actual: [u8; 32] = self.hash.finalize().into();
         ensure!(
             actual == expected,

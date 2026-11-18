@@ -20,6 +20,9 @@ use std::{
 use tempfile::NamedTempFile;
 
 #[cfg(test)]
+#[path = "replace_tests.rs"]
+mod replace_tests;
+#[cfg(test)]
 #[path = "stage_tests.rs"]
 mod tests;
 
@@ -208,14 +211,51 @@ pub enum ParentSync {
     Synced,
     Unsupported,
 }
+
+/// Which clobber mode a publication attempt used. Kept separate from the size
+/// and digest so a caller cannot read "published" as "created": a replacement
+/// destroyed bytes that the pre-image check authorized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishMode {
+    /// Destination had to be absent.
+    CreateNoClobber,
+    /// Destination existed and matched the authorized pre-image; it was replaced
+    /// with an atomic rename over the existing name.
+    ReplaceExisting,
+}
+
+/// Caller-authorized replacement condition. Constructing this does NOT prove the
+/// target currently matches: the pre-image is re-hashed from the live target
+/// handle inside the fs_gate immediately before the replacing rename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreImage {
+    sha256: [u8; 32],
+    bytes: u64,
+}
+impl PreImage {
+    pub fn new(sha256: [u8; 32], bytes: u64) -> Result<Self> {
+        ensure!(
+            bytes <= super::protocol::MAX_FILE_BYTES,
+            "pre-image size over ceiling"
+        );
+        Ok(Self { sha256, bytes })
+    }
+    pub fn sha256(self) -> [u8; 32] {
+        self.sha256
+    }
+    pub fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Publication {
-    /// File data sync + no-clobber publication succeeded. Not a journal receipt
-    /// and not proof of crash durability on platforms without parent sync.
+    /// File data sync + publication succeeded. Not a journal receipt and not
+    /// proof of crash durability on platforms without parent sync.
     Published {
         size: u64,
         sha256: [u8; 32],
         parent_sync: ParentSync,
+        mode: PublishMode,
     },
     /// A publication was attempted. Never turn this into a safe-to-retry failure.
     Uncertain {
@@ -373,6 +413,95 @@ impl VerifiedStage {
         // Gate remains owned until the no-clobber attempt/cleanup/parent sync.
         Ok(self.stage.publish_admitted(self.size, self.sha256, parent))
     }
+    /// Atomic REPLACE of an existing destination after re-hashing the live
+    /// pre-image inside the fs_gate. The pre-image is a caller authorization, not
+    /// an observation: it is re-read here and any difference refuses the whole
+    /// publication and returns the stage with its quota. An external writer that
+    /// changes the file AFTER this check is not excluded (same boundary as the
+    /// rest of the receiver), and a failed replace is Uncertain, never retryable.
+    pub fn publish_replacing(
+        self,
+        pre: PreImage,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> std::result::Result<Publication, StageRejected<Self>> {
+        if !self.stage.replacing {
+            return Err(StageRejected::new(
+                self,
+                anyhow::anyhow!("stage was not prepared against a pre-image"),
+            ));
+        }
+        self.publish_replace_checked(pre, || Ok(()), admit)
+    }
+    pub fn publish_replace_checked(
+        mut self,
+        pre: PreImage,
+        mut check: impl FnMut() -> Result<()>,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> std::result::Result<Publication, StageRejected<Self>> {
+        let gate = Arc::clone(&self.stage.fs_gate);
+        let _guard = match gate.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(StageRejected::new(
+                    self,
+                    anyhow::anyhow!("filesystem gate poisoned"),
+                ));
+            }
+        };
+        let preflight = (|| -> Result<PathBuf> {
+            ensure!(
+                !self.stage.faulted
+                    && !self
+                        .stage
+                        ._reservation
+                        .ownership_uncertain
+                        .load(Ordering::SeqCst),
+                "stage fault/ownership quarantined"
+            );
+            ensure!(
+                self.stage.stage.as_file().metadata()?.len() == self.size,
+                "verified stage size changed"
+            );
+            ensure!(
+                self.stage.policy.allow_transfers
+                    && self.stage.policy.resolve(&self.stage.input)? == self.stage.destination,
+                "fleet destination policy changed"
+            );
+            check()?;
+            self.stage.check_identity()?;
+            let file = self.stage.stage.as_file_mut();
+            file.seek(SeekFrom::Start(0))?;
+            let (actual, read) = digest_reader(&mut file.take(self.size + 1), &mut check)?;
+            ensure!(
+                read == self.size && actual == self.sha256,
+                "verified stage content changed before publication"
+            );
+            self.stage.stage.as_file().sync_all()?;
+            self.stage.check_identity()?;
+            check()?;
+            // The destination must still be the SAME plain object with the SAME
+            // bytes the grant authorized. Absence is a failure, not a fallback to
+            // create: the permission this stage carries is replace-only.
+            let (current_sha, current_bytes) = digest_existing(&self.stage.destination)?;
+            ensure!(
+                current_sha == pre.sha256 && current_bytes == pre.bytes,
+                "destination no longer matches the authorized pre-image"
+            );
+            let parent = self
+                .stage
+                .destination
+                .parent()
+                .context("destination has no parent")?
+                .to_path_buf();
+            admit()?;
+            Ok(parent)
+        })();
+        let parent = match preflight {
+            Ok(p) => p,
+            Err(e) => return Err(StageRejected::new(self, e)),
+        };
+        Ok(self.stage.publish_replaced(self.size, self.sha256, parent))
+    }
 }
 
 // NamedTempFile alone unlinks by NAME, even after the path has been replaced.
@@ -465,6 +594,16 @@ impl GuardedTempFile {
             .expect("live stage")
             .persist_noclobber(destination)
     }
+    // Atomic replace: tempfile::persist renames over the target in one step
+    // (MoveFileExW with REPLACE_EXISTING on Windows, rename(2) elsewhere), so a
+    // reader never observes a half-written destination. Only used after the
+    // pre-image was re-hashed under the same gate.
+    fn persist_replace(
+        mut self,
+        destination: &Path,
+    ) -> std::result::Result<fs::File, tempfile::PersistError> {
+        self.file.take().expect("live stage").persist(destination)
+    }
 }
 impl Drop for GuardedTempFile {
     fn drop(&mut self) {
@@ -507,7 +646,20 @@ pub struct StageFile {
     fs_gate: Arc<Mutex<()>>,
     ranges: ReceiveRanges,
     faulted: bool,
+    replacing: bool,
     _reservation: Reservation,
+}
+/// Hash an EXISTING destination through a no-follow, plain-object handle.
+/// Deliberately NOT the identity/stage privacy check: a replace target is an
+/// ordinary user file, so requiring a single-user DACL would refuse legitimate
+/// replacements. Links, reparse points, special objects and multi-link files are
+/// still refused, because replacing them would rewrite bytes reachable elsewhere.
+pub(super) fn digest_existing(path: &Path) -> Result<([u8; 32], u64)> {
+    let file = super::source_file::open_object(path, false)?;
+    super::source_file::object_id(&file, false)?;
+    let mut reader = &file;
+    let (sha, read) = digest_reader(&mut reader, &mut || Ok(()))?;
+    Ok((sha, read))
 }
 fn absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -554,6 +706,31 @@ impl StageFile {
         budget: &StageBudget,
         fs_gate: Arc<Mutex<()>>,
     ) -> Result<Self> {
+        Self::prepare_mode(policy, input, total, budget, fs_gate, None)
+    }
+    /// Replace-mode staging. `pre` is the caller-authorized pre-image; when it is
+    /// present the destination MUST already exist as a plain single-link file and
+    /// is hashed under the fs_gate before any byte is accepted. The stage itself
+    /// is still a fresh CREATE_NEW temp file, so the pre-image is never modified
+    /// until the final replacing rename.
+    pub fn prepare_replacing(
+        policy: Policy,
+        input: &str,
+        total: u64,
+        budget: &StageBudget,
+        fs_gate: Arc<Mutex<()>>,
+        pre: PreImage,
+    ) -> Result<Self> {
+        Self::prepare_mode(policy, input, total, budget, fs_gate, Some(pre))
+    }
+    fn prepare_mode(
+        policy: Policy,
+        input: &str,
+        total: u64,
+        budget: &StageBudget,
+        fs_gate: Arc<Mutex<()>>,
+        pre: Option<PreImage>,
+    ) -> Result<Self> {
         ensure!(policy.allow_transfers, "transfers disabled by local policy");
         let mut reservation = budget.reserve(total)?;
         let destination;
@@ -572,7 +749,19 @@ impl StageFile {
                     .starts_with(".ferroc-fleet-"),
                 "reserved fleet stage namespace"
             );
-            absent(&destination)?;
+            match pre {
+                None => absent(&destination)?,
+                Some(pre) => {
+                    // The pre-image describes the EXISTING file, whose size is
+                    // independent of the new content size. Only its digest and
+                    // length are compared against the real destination.
+                    let actual = digest_existing(&destination)?;
+                    ensure!(
+                        actual == (pre.sha256, pre.bytes),
+                        "destination no longer matches the authorized pre-image"
+                    );
+                }
+            }
             let parent = destination.parent().context("destination has no parent")?;
             ensure!(parent.is_dir(), "destination parent must exist");
             stage = tempfile::Builder::new()
@@ -594,8 +783,13 @@ impl StageFile {
             fs_gate,
             ranges: ReceiveRanges::new(total)?,
             faulted: false,
+            replacing: pre.is_some(),
             _reservation: reservation,
         })
+    }
+    /// True when this stage was admitted against an authorized pre-image.
+    pub fn is_replacing(&self) -> bool {
+        self.replacing
     }
     pub fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<Admission> {
         self.write_using(offset, data, |f, offset, data| {
@@ -722,6 +916,51 @@ impl StageFile {
             .publish_with(|| Ok(()))
             .map_err(|e| e.into_parts().1)
     }
+    fn publish_replaced(self, total: u64, actual: [u8; 32], parent: PathBuf) -> Publication {
+        let old_stage = self.stage.path().to_path_buf();
+        // From here on the destination may already hold the new bytes. Any error
+        // is Uncertain: it must never be reported as a safe-to-retry failure.
+        let _replaced = match self.stage.persist_replace(&self.destination) {
+            Ok(file) => file,
+            Err(_) => {
+                return Publication::Uncertain {
+                    size: total,
+                    sha256: actual,
+                    reason: "replacing publication error; reconcile destination",
+                };
+            }
+        };
+        if !matches!(fs::symlink_metadata(&old_stage), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Publication::Uncertain {
+                size: total,
+                sha256: actual,
+                reason: "temporary link cleanup not confirmed",
+            };
+        }
+        #[cfg(unix)]
+        let parent_sync = {
+            if fs::File::open(&parent).and_then(|f| f.sync_all()).is_err() {
+                return Publication::Uncertain {
+                    size: total,
+                    sha256: actual,
+                    reason: "parent directory sync failed after publication",
+                };
+            }
+            ParentSync::Synced
+        };
+        #[cfg(not(unix))]
+        let parent_sync = {
+            let _ = parent;
+            ParentSync::Unsupported
+        };
+        Publication::Published {
+            size: total,
+            sha256: actual,
+            parent_sync,
+            mode: PublishMode::ReplaceExisting,
+        }
+    }
     fn publish_admitted(self, total: u64, actual: [u8; 32], parent: PathBuf) -> Publication {
         let old_stage = self.stage.path().to_path_buf();
         // Once persist has been called, fail conservatively. tempfile guarantees
@@ -764,6 +1003,7 @@ impl StageFile {
             size: total,
             sha256: actual,
             parent_sync,
+            mode: PublishMode::CreateNoClobber,
         }
     }
 }

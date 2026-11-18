@@ -38,6 +38,212 @@ impl Runtime {
             fleet_hosts: Arc::new(Mutex::new(crate::fleet::host::HostRegistration::default())),
         }
     }
+    /// Explicit LOCAL task attachment. It shares this Runtime's lifecycle, not
+    /// a network/enrollment backend or enabled MCP catalog. One registry only.
+    /// Trusted workers must not call shutdown on their own owning Runtime.
+    #[cfg(feature = "fleet-core")]
+    pub fn open_fleet_tasks(
+        &self,
+        capacity: usize,
+    ) -> Result<crate::fleet::transfer_tasks::TransferTasks> {
+        let mut state = self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
+        ensure!(!state.stopped, "Runtime fleet lifecycle stopped");
+        ensure!(self.policy.allow_transfers, "transfers disabled");
+        ensure!(state.tasks.is_none(), "Runtime already has fleet tasks");
+        let tasks = crate::fleet::transfer_tasks::TransferTasks::new(capacity)?;
+        state.tasks = Some(tasks.clone());
+        Ok(tasks)
+    }
+    /// Shared local task id space; terminal history remains readable after stop.
+    /// A returned clone cannot reopen a registry that has been shut down.
+    #[cfg(feature = "fleet-core")]
+    pub fn fleet_tasks(&self) -> Result<Option<crate::fleet::transfer_tasks::TransferTasks>> {
+        Ok(self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?
+            .tasks
+            .clone())
+    }
+    /// Explicit LOCAL MCP transfer surface over preapproved source rounds.
+    /// Default stock agent does not attach it; no remote caller can mint grants.
+    #[cfg(feature = "fleet-core")]
+    pub fn open_fleet_mcp(
+        self: &Arc<Self>,
+        provision: std::sync::Arc<crate::fleet::setup_config::SetupProvision>,
+        capacity: usize,
+    ) -> Result<()> {
+        let mut state = self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
+        ensure!(!state.stopped, "Runtime fleet lifecycle stopped");
+        ensure!(self.policy.allow_transfers, "transfers disabled");
+        ensure!(state.mcp.is_none(), "Runtime already has fleet MCP");
+        ensure!(state.tasks.is_none(), "Runtime already has fleet tasks");
+        // Keep the short attachment cut through construction: shutdown cannot
+        // win between validation and installing an untracked task table.
+        let mcp = crate::fleet::mcp_transfer::McpTransfer::open(self, provision, capacity)?;
+        state.tasks = Some(mcp.task_table());
+        state.mcp = Some(mcp);
+        Ok(())
+    }
+    /// Shared local MCP transfer surface; None for the stock agent.
+    #[cfg(feature = "fleet-core")]
+    pub(crate) fn fleet_mcp(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::fleet::mcp_transfer::McpTransfer>>> {
+        Ok(self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?
+            .mcp
+            .clone())
+    }
+    /// Explicit configured agent setup scope. Stock agent/CLI/MCP do not call
+    /// this. Replacing a scope requires the old one to be closed AND drained.
+    #[cfg(feature = "fleet-core")]
+    pub fn open_fleet_setup(
+        self: &Arc<Self>,
+        device: &str,
+        capacity: usize,
+    ) -> Result<(
+        crate::fleet::setup_agent::SetupBackend,
+        crate::fleet::setup_agent::SetupOutbox,
+    )> {
+        let mut state = self.fleet_source_guard()?;
+        if let Some(previous) = state.setup.upgrade() {
+            ensure!(previous.retired()?, "Runtime setup scope still live");
+        }
+        let (backend, outbox) = crate::fleet::setup_agent::SetupBackend::create(
+            Arc::downgrade(self),
+            device,
+            capacity,
+        )?;
+        state.setup = backend.control();
+        Ok((backend, outbox))
+    }
+    /// Current/latest scope; terminal history may remain readable after stop.
+    #[cfg(feature = "fleet-core")]
+    pub fn fleet_setup(&self) -> Result<Option<crate::fleet::setup_agent::SetupBackend>> {
+        Ok(self
+            .fleet_hosts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?
+            .setup
+            .upgrade()
+            .map(crate::fleet::setup_agent::SetupBackend::from_control))
+    }
+
+    /// Consume this round's proof using an independently approved LOCAL anchor.
+    /// No remote time import, route/File/DB capability or persistence.
+    #[cfg(feature = "fleet-core")]
+    pub fn authenticate_fleet_setup(
+        self: &Arc<Self>,
+        prepared: crate::fleet::setup::PreparedSetup,
+        local: crate::fleet::setup_agent::LocalSetupApproval,
+        role: crate::fleet::protocol::Direction,
+        anchor: crate::fleet::lease::TrustedTimeAnchor,
+    ) -> Result<crate::fleet::setup_lease::SetupLease> {
+        crate::fleet::setup_lease::authenticate_local(
+            self,
+            self.fs_gate.clone(),
+            prepared,
+            local,
+            role,
+            anchor,
+        )
+    }
+
+    /// Explicit LOCAL resume approval + actual setup ephemeral, checked under
+    /// this Runtime's registry/gate. Crypto-only owner; no route/File/DB handoff.
+    #[cfg(feature = "fleet-core")]
+    pub fn authenticate_fleet_resume_setup(
+        self: &Arc<Self>,
+        prepared: crate::fleet::setup::PreparedSetup,
+        approval: crate::fleet::setup_resume::LocalResumeSetupApproval,
+        anchor: crate::fleet::lease::TrustedTimeAnchor,
+    ) -> Result<crate::fleet::setup_resume::ResumeSetupLease> {
+        crate::fleet::setup_resume::authenticate_local(
+            self,
+            self.fs_gate.clone(),
+            prepared,
+            approval,
+            anchor,
+        )
+    }
+
+    /// Explicit local policy + peer approval for one signing role. No remote
+    /// consent/time service or publication capability; not exposed as MCP.
+    #[cfg(feature = "fleet-core")]
+    pub fn approve_fleet_grant(
+        &self,
+        store: &crate::fleet::identity::IdentityStore,
+        request: crate::fleet::issuance::LocalApprovalRequest<'_>,
+        now_ms: u64,
+    ) -> Result<crate::fleet::issuance::SignedLocalGrant> {
+        crate::fleet::issuance::approve_local(self, self.fs_gate.clone(), store, request, now_ms)
+    }
+    /// Explicit local resume-condition signing under the same registry/gate and
+    /// current identity/pin/endpoint checks as ordinary grant approval. It does
+    /// NOT install records, establish source coverage or reopen a target stage.
+    #[cfg(feature = "fleet-core")]
+    pub fn approve_fleet_resume(
+        &self,
+        store: &crate::fleet::identity::IdentityStore,
+        request: crate::fleet::issuance::LocalApprovalRequest<'_>,
+        condition: &crate::fleet::resume_condition::ResumeProposal,
+        now_ms: u64,
+    ) -> Result<crate::fleet::issuance::SignedLocalResume> {
+        crate::fleet::issuance::approve_resume_local(
+            self,
+            self.fs_gate.clone(),
+            store,
+            request,
+            condition,
+            now_ms,
+        )
+    }
+    /// Candidate one-shot setup; only the local source identity/ephemeral is held.
+    #[cfg(feature = "fleet-core")]
+    pub fn begin_fleet_setup<'a>(
+        &'a self,
+        store: &'a crate::fleet::identity::IdentityStore,
+        proposal: &crate::fleet::job::ValidatedGrant,
+        peer: crate::fleet::setup::SetupPeer<'a>,
+        now_ms: u64,
+    ) -> Result<(
+        crate::fleet::setup::PendingSource<'a>,
+        crate::fleet::setup::SetupOffer,
+    )> {
+        crate::fleet::setup::begin_source(self, self.fs_gate.clone(), store, proposal, peer, now_ms)
+    }
+    /// The expected proposal/profile are LOCAL decisions, not taken from the offer.
+    #[cfg(feature = "fleet-core")]
+    pub fn accept_fleet_setup<'a>(
+        &'a self,
+        store: &'a crate::fleet::identity::IdentityStore,
+        expected: &crate::fleet::job::ValidatedGrant,
+        peer: crate::fleet::setup::SetupPeer<'a>,
+        offer: crate::fleet::setup::SetupOffer,
+        now_ms: u64,
+    ) -> Result<(
+        crate::fleet::setup::PendingTarget<'a>,
+        crate::fleet::setup::SetupResponse,
+    )> {
+        crate::fleet::setup::accept_target(
+            self,
+            self.fs_gate.clone(),
+            store,
+            expected,
+            peer,
+            offer,
+            now_ms,
+        )
+    }
     /// Candidate P1 source IO. Reads ONLY the path bound to a fresh Source lease.
     /// Not a network/CLI/MCP entry point, scanner, durable sender or resume API.
     #[cfg(feature = "fleet-core")]
@@ -47,7 +253,25 @@ impl Runtime {
     ) -> Result<crate::fleet::source_file::SourceFile<'_>> {
         crate::fleet::source_file::SourceFile::open(self, records, self.fs_gate.clone())
     }
-    /// Windows-only LOCAL bounded tree read under this Runtime's current policy.
+    /// LOCAL original-File continuation. Consumes the fresh BOTH-proof Source
+    /// owner, rehashes the actual approved prefix under registry/gate/lease checks,
+    /// and keeps its real SHA state/cursor. Not network/window negotiation,
+    /// source-journal recovery, stable current bytes or target publication.
+    #[cfg(feature = "fleet-core")]
+    pub fn open_fleet_resume_source(
+        &self,
+        owner: crate::fleet::resume_lease::ResumeLease,
+        max_prefix_bytes: u64,
+    ) -> Result<crate::fleet::source_file::SourceFile<'_>> {
+        crate::fleet::source_file::SourceFile::open_resume(
+            self,
+            owner,
+            self.fs_gate.clone(),
+            max_prefix_bytes,
+        )
+    }
+
+    /// Windows/Linux LOCAL bounded tree read under this Runtime's current policy.
     /// No remote manifest authority, snapshot, publication or network capability.
     #[cfg(feature = "fleet-core")]
     pub fn scan_fleet_manifest(
@@ -56,9 +280,33 @@ impl Runtime {
         limits: crate::fleet::manifest_scan::ScanLimits,
         cancel: &crate::fleet::sync_exec::CancelToken,
     ) -> Result<crate::fleet::manifest_scan::ManifestObservation> {
-        crate::fleet::manifest_scan::observe(self, self.fs_gate.clone(), root, limits, cancel)
+        self.scan_fleet_manifest_with_rules(
+            root,
+            limits,
+            &crate::fleet::manifest_view::ScanRules::default(),
+            cancel,
+        )
     }
-    /// Windows-only LOCAL read-only preflight of an add-only plan destinations.
+    /// Explicit exact-subtree filtering; same read-only policy/gate/lifecycle.
+    /// Excluded descendants are never opened; inspected parent names still count.
+    #[cfg(feature = "fleet-core")]
+    pub fn scan_fleet_manifest_with_rules(
+        &self,
+        root: &std::path::Path,
+        limits: crate::fleet::manifest_scan::ScanLimits,
+        rules: &crate::fleet::manifest_view::ScanRules,
+        cancel: &crate::fleet::sync_exec::CancelToken,
+    ) -> Result<crate::fleet::manifest_scan::ManifestObservation> {
+        crate::fleet::manifest_scan::observe(
+            self,
+            self.fs_gate.clone(),
+            root,
+            limits,
+            cancel,
+            rules,
+        )
+    }
+    /// LOCAL read-only preflight of add-only plan destinations (Windows/Linux).
     /// Never creates a directory/file and never publishes; not a grant/reservation.
     #[cfg(feature = "fleet-core")]
     pub fn preflight_fleet_target(
@@ -77,7 +325,7 @@ impl Runtime {
             cancel,
         )
     }
-    #[cfg(all(test, windows, feature = "fleet-core"))]
+    #[cfg(all(test, any(windows, target_os = "linux"), feature = "fleet-core"))]
     pub(crate) fn preflight_fleet_target_for_test(
         &self,
         root: &std::path::Path,
@@ -121,8 +369,8 @@ impl Runtime {
         ensure!(self.policy.allow_transfers, "transfers disabled");
         Ok(state)
     }
-    /// Explicit experimental LOCAL host attachment, default paused. No CLI/MCP
-    /// entrypoint invokes this. The borrow pins this Runtime/policy lifetime and
+    /// Explicit experimental LOCAL host attachment, default paused. Configured
+    /// target pumps invoke it; the borrow pins this Runtime/policy lifetime and
     /// the host reuses the actual filesystem gate; callers cannot substitute one.
     #[cfg(feature = "fleet-core")]
     pub fn open_fleet_host(
@@ -160,20 +408,41 @@ impl Runtime {
     #[cfg(feature = "fleet-core")]
     pub async fn shutdown_fleet_host(&self) -> Result<()> {
         let registry = self.fleet_hosts.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let control = {
-                let mut state = registry
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
-                state.stopped = true;
-                state.control.upgrade()
-            };
-            if let Some(control) = control {
-                control.stop_and_drain()?;
-            }
-            Ok(())
+        // Registry -> short host/task control locks only. Never hold registry,
+        // fs_gate or a database across await. Accepted construction completes
+        // before this cut; no new source/host/task attachment can pass it.
+        let (tasks, setup, control) = tokio::task::spawn_blocking(move || {
+            let mut state = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Runtime fleet registration poisoned"))?;
+            state.stopped = true;
+            let tasks = state.tasks.clone();
+            let control = state.control.upgrade();
+            let setup = state.setup.upgrade();
+            // Attempt both stops even if one control is poisoned. This phase
+            // signals task cancellation before any asynchronous drain, so a
+            // dropped shutdown observer cannot reopen admission or strand work.
+            let host_stop = control.as_ref().map(|c| c.stop_admission()).transpose();
+            let task_stop = tasks.as_ref().map(|t| t.stop_admission()).transpose();
+            let setup_stop = setup.as_ref().map(|s| s.stop_admission()).transpose();
+            host_stop?;
+            task_stop?;
+            setup_stop?;
+            Ok::<_, anyhow::Error>((tasks, setup, control))
         })
-        .await?
+        .await??;
+        // A task can own an idle receiver/candidate. Drop that future FIRST,
+        // otherwise waiting on the host Operation here would deadlock.
+        if let Some(setup) = setup {
+            setup.drain().await?;
+        }
+        if let Some(tasks) = tasks {
+            tasks.shutdown().await?;
+        }
+        if let Some(control) = control {
+            tokio::task::spawn_blocking(move || control.stop_and_drain()).await??;
+        }
+        Ok(())
     }
 
     pub async fn call(&self, tool: &str, args: Value) -> ToolResult {
@@ -258,6 +527,87 @@ impl Runtime {
                 })
                 .await?
             }
+            #[cfg(feature = "fleet-core")]
+            "send_file" | "sync_dir" | "transfer_get" | "transfer_cancel" => {
+                let mcp = self.fleet_mcp()?.ok_or_else(|| {
+                    anyhow::anyhow!("fleet transfer tools are not enabled locally")
+                })?;
+                match tool {
+                    "send_file" => {
+                        let round = uuid::Uuid::parse_str(string(&args, "roundId")?)?;
+                        let budget = integer(&args, "timeoutMs", 300_000, 1, 300_000)? as u64;
+                        let id = mcp.send_file(round, std::time::Duration::from_millis(budget))?;
+                        Ok(json!({"taskId": id, "status": "queued"}))
+                    }
+                    "sync_dir" => {
+                        let values = args
+                            .get("rounds")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| anyhow::anyhow!("rounds must be an array"))?;
+                        let mut rounds = Vec::with_capacity(values.len());
+                        for value in values {
+                            rounds.push(uuid::Uuid::parse_str(
+                                value
+                                    .as_str()
+                                    .ok_or_else(|| anyhow::anyhow!("round id must be a string"))?,
+                            )?);
+                        }
+                        let budget = integer(&args, "timeoutMs", 300_000, 1, 300_000)? as u64;
+                        let ids =
+                            mcp.sync_dir(&rounds, std::time::Duration::from_millis(budget))?;
+                        Ok(json!({"taskIds": ids, "status": "queued"}))
+                    }
+                    "transfer_get" => {
+                        let id = uuid::Uuid::parse_str(string(&args, "taskId")?)?;
+                        Ok(serde_json::to_value(mcp.get(id)?)?)
+                    }
+                    "transfer_cancel" => {
+                        // Exactly one of taskId / roundId / rounds. A round id
+                        // also withdraws a waiter that never received its owner,
+                        // so a cancelled round cannot start DATA later.
+                        ensure!(
+                            ["taskId", "roundId", "rounds"]
+                                .iter()
+                                .filter(|key| args.get(**key).is_some())
+                                .count()
+                                == 1,
+                            "transfer_cancel needs exactly one of taskId, roundId or rounds"
+                        );
+                        if args.get("taskId").is_some() {
+                            let raw = string(&args, "taskId")?;
+                            let id = uuid::Uuid::parse_str(raw)?;
+                            return Ok(json!({"cancelled": mcp.cancel(id)?}));
+                        }
+                        if args.get("roundId").is_some() {
+                            let raw = string(&args, "roundId")?;
+                            let round = uuid::Uuid::parse_str(raw)?;
+                            return Ok(json!({"cancelled": mcp.cancel_round(round)?}));
+                        }
+                        let values =
+                            args.get("rounds")
+                                .and_then(Value::as_array)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "transfer_cancel needs taskId, roundId or rounds"
+                                    )
+                                })?;
+                        ensure!(
+                            (1..=8).contains(&values.len()),
+                            "cancel batch needs 1..=8 rounds"
+                        );
+                        let mut rounds = Vec::with_capacity(values.len());
+                        for value in values {
+                            rounds.push(uuid::Uuid::parse_str(
+                                value
+                                    .as_str()
+                                    .ok_or_else(|| anyhow::anyhow!("round id must be a string"))?,
+                            )?);
+                        }
+                        Ok(json!({"cancelled": mcp.cancel_batch(&rounds)?}))
+                    }
+                    _ => unreachable!(),
+                }
+            }
             _ => bail!("unknown or not implemented tool: {tool}"),
         }
     }
@@ -292,6 +642,19 @@ fn def(name: &str, description: &str, properties: Value, required: &[&str]) -> T
         input_schema: json!({"type":"object","properties":properties,"required":required}),
     }
 }
+impl Runtime {
+    /// Local catalog: the four fleet transfer tools appear ONLY when this
+    /// Runtime has an explicitly attached local MCP transfer surface.
+    #[cfg(feature = "fleet-core")]
+    pub fn tools_for(&self) -> Result<Vec<ToolDefinition>> {
+        let mut base = tools();
+        if self.fleet_mcp()?.is_some() {
+            base.extend(crate::fleet::mcp_transfer::tool_definitions());
+        }
+        Ok(base)
+    }
+}
+
 pub fn tools() -> Vec<ToolDefinition> {
     let s = prop("string");
     let n = prop("integer");

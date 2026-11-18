@@ -46,11 +46,11 @@ impl FinishedCandidate<'_, '_> {
     }
 }
 impl<'h, 'r> ReceiptedCandidate<'h, 'r> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(in super::super::super::super) fn test_expire(&mut self) {
         self.inner.test_expire()
     }
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(in super::super::super::super) fn test_move(&self, p: &Path) -> Result<()> {
         self.inner.test_move(p)
     }

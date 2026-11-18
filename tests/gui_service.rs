@@ -64,6 +64,10 @@ fn options(root: &Path, bind: SocketAddr) -> GuiOptions {
         relay: None,
         home: root.join("credentials"),
         name: "GUI lifecycle test".into(),
+        // The lifecycle fixture never arms fleet rounds; the dedicated tests in
+        // src/gui_service_tests.rs cover the fail-fast rules for this field.
+        #[cfg(feature = "fleet-core")]
+        fleet_setup: None,
     }
 }
 async fn phase(control: &GuiControl, expected: Phase) {

@@ -1,4 +1,53 @@
 use super::*;
+#[test]
+fn fresh_window_refuses_authenticated_resume_ready_even_zero_base() {
+    use sha2::Digest;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.bin");
+    let target = temp.path().join("target.bin");
+    std::fs::write(&source, b"abc").unwrap();
+    let mut o = Offer::paths(
+        b"abc",
+        0,
+        source.to_str().unwrap().to_owned(),
+        target.to_str().unwrap().to_owned(),
+    );
+    o.g =
+        o.g.grant()
+            .clone()
+            .validate_for_profile(
+                o.g.job().clone(),
+                crate::fleet::job::LeaseProfile::SingleOwner,
+            )
+            .unwrap();
+    let (s, mut p) = pair300(o);
+    let r = crate::runtime::Runtime::new(
+        crate::config::Policy::new(vec![temp.path().to_path_buf()], false).unwrap(),
+    );
+    let mut w = SourceWindow::new(r.open_fleet_source(s).unwrap(), 2).unwrap();
+    let frame = p
+        .seal_control(ControlBody::ResumeReady(
+            crate::fleet::control::ResumeReady {
+                base: crate::fleet::control::ResumeBase {
+                    condition_digest: [1; 32],
+                    prefix_bytes: 0,
+                    prefix_sha256: sha2::Sha256::digest([]).into(),
+                },
+                chunk_bytes: 65536,
+                window_chunks: 2,
+            },
+        ))
+        .unwrap();
+    assert!(w.observe_control(&frame).is_err());
+    assert!(w.is_faulted());
+    assert_eq!(w.bytes_encoded(), 0);
+}
+#[test]
+fn explicit_resume_window_never_promotes_fresh_source_to_resume_mode() {
+    let (_t, r, s, _p) = file_source_fixture(b"abc");
+    assert!(SourceWindow::resuming(r.open_fleet_source(s).unwrap(), 2).is_err());
+}
+
 #[path = "source_renewal_tests.rs"]
 mod renewal_tests;
 use crate::fleet::{
@@ -117,6 +166,77 @@ fn waits_ready_then_bounded_window_and_exact_retries() {
         .unwrap();
     assert_eq!(end.observe_final(&f).unwrap(), FinalAckOutcome::Accepted);
 }
+#[test]
+fn maximum_chunk_real_file_keeps_eight_original_ciphertexts_within_exact_capacity() {
+    let chunk = crate::fleet::protocol::MAX_DATA;
+    let data = vec![0x71; 8 * chunk + 1];
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.bin");
+    std::fs::write(&source, &data).unwrap();
+    let offer = Offer::paths_with_chunk(
+        &data,
+        0,
+        source.to_str().unwrap().into(),
+        temp.path().join("dest.bin").to_str().unwrap().into(),
+        chunk as u32,
+    );
+    let (s, mut peer) = pair300(offer);
+    let runtime = crate::runtime::Runtime::new(
+        crate::config::Policy::new(vec![temp.path().to_owned()], false).unwrap(),
+    );
+    let mut window = SourceWindow::new(runtime.open_fleet_source(s).unwrap(), 8).unwrap();
+    assert_eq!(window.next_record().unwrap(), WindowRecord::WaitingForReady);
+    let rd = peer
+        .seal_control(ControlBody::Ready(Ready {
+            chunk_bytes: chunk as u32,
+            window_chunks: 8,
+        }))
+        .unwrap();
+    window.observe_control(&rd).unwrap();
+    for index in 0..8 {
+        let (offset, ciphertext) = take(&mut window);
+        assert_eq!(offset, (index * chunk) as u64);
+        assert_eq!(ciphertext.len(), chunk + 232);
+        match peer.open_record(&ciphertext).unwrap() {
+            PeerRecord::Data { header, bytes } => {
+                assert_eq!(header.offset, offset);
+                assert_eq!(bytes.len(), chunk);
+                assert!(bytes.iter().all(|byte| *byte == 0x71));
+            }
+            _ => panic!("DATA expected"),
+        }
+    }
+    assert_eq!(window.pending_records(), 8);
+    assert_eq!(window.pending_ciphertext_bytes(), 8 * (chunk + 232));
+    assert_eq!(
+        window.pending_ciphertext_bytes(),
+        window.ciphertext_capacity_bytes()
+    );
+    assert_eq!(window.next_record().unwrap(), WindowRecord::Backpressured);
+    assert_eq!(window.bytes_encoded(), (8 * chunk) as u64);
+    let retry = window.retry_record(0).unwrap().to_vec();
+    assert_eq!(window.retry_record(0).unwrap(), retry);
+    window
+        .observe_control(&ack(&mut peer, (8 * chunk) as u64, (8 * chunk) as u64))
+        .unwrap();
+    assert_eq!(window.pending_records(), 0);
+    let (_, tail) = take(&mut window);
+    peer.open_record(&tail).unwrap();
+    window
+        .observe_control(&ack(&mut peer, data.len() as u64, data.len() as u64))
+        .unwrap();
+    assert_eq!(window.next_record().unwrap(), WindowRecord::Exhausted);
+    let mut end = window.finish().unwrap();
+    peer.open_record(end.finish_record()).unwrap();
+    let final_ack = peer
+        .seal_control(ControlBody::CommitAck(receipt(&data)))
+        .unwrap();
+    assert_eq!(
+        end.observe_final(&final_ack).unwrap(),
+        FinalAckOutcome::Accepted
+    );
+}
+
 #[test]
 fn remote_smaller_window_wins() {
     let (_t, r, s, mut p) = file_source_fixture(&vec![2; 131072]);

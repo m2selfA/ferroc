@@ -73,8 +73,18 @@ struct Connected {
     generation: String,
     tools: Vec<ToolDefinition>,
     tx: mpsc::Sender<Outbound>,
+    #[cfg(feature = "fleet-core")]
+    token_hash: String,
+    #[cfg(feature = "fleet-core")]
+    setup_scope: Option<Uuid>,
+    #[cfg(feature = "fleet-core")]
+    route_scope: Option<Uuid>,
 }
 enum Outbound {
+    #[cfg(feature = "fleet-core")]
+    Setup(crate::fleet::setup_broker::Delivery),
+    #[cfg(feature = "fleet-core")]
+    Data(crate::fleet::route_control::RouteDelivery),
     Frame(Value),
     Close,
 }
@@ -92,6 +102,13 @@ impl Drop for PendingLease<'_> {
         self.table.lock().expect("pending lock").remove(&self.id);
     }
 }
+#[cfg(feature = "fleet-core")]
+#[path = "fleet/route_relay.rs"]
+mod route_control;
+#[cfg(feature = "fleet-core")]
+#[path = "fleet/setup_relay.rs"]
+mod setup_control;
+
 pub struct Relay {
     pub(crate) store: Store,
     pub(crate) origin: String,
@@ -132,6 +149,13 @@ impl Relay {
     pub fn router(self: Arc<Self>) -> Router {
         self.router_extra(Router::new())
     }
+    /// Explicit setup-only control on existing /ws. No DATA/renew routes.
+    #[cfg(feature = "fleet-core")]
+    pub fn router_with_setup(self: Arc<Self>) -> Router {
+        self.router().layer(axum::Extension(Arc::new(
+            crate::fleet::setup_broker::SetupBroker::default(),
+        )))
+    }
     /// Explicit default-off candidate route on this SAME relay/listener/store.
     #[cfg(feature = "fleet-core")]
     pub fn router_with_fleet(
@@ -139,6 +163,27 @@ impl Relay {
         fleet: Arc<crate::fleet::relay_channel::FleetRelay>,
     ) -> Router {
         self.router_extra(crate::fleet::relay_channel::routes(fleet))
+            .layer(axum::Extension(Arc::new(
+                crate::fleet::setup_broker::SetupBroker::default(),
+            )))
+    }
+    /// Separate explicit local grant-bound route authority; setup alone never
+    /// creates DATA tickets. No new listener/process/store or MCP tool.
+    #[cfg(feature = "fleet-core")]
+    pub fn router_with_approved_routes(
+        self: Arc<Self>,
+        local: crate::fleet::route_control::ApprovedDataRoutes,
+    ) -> Router {
+        let broker = Arc::new(crate::fleet::setup_broker::SetupBroker::default());
+        let fleet = Arc::new(crate::fleet::relay_channel::FleetRelay::new());
+        let control = Arc::new(crate::fleet::route_control::RouteControl::new(
+            broker.scope(),
+            fleet.clone(),
+            local,
+        ));
+        self.router_extra(crate::fleet::relay_channel::routes(fleet))
+            .layer(axum::Extension(broker))
+            .layer(axum::Extension(control))
     }
     fn router_extra(self: Arc<Self>, extra: Router<Arc<Self>>) -> Router {
         let router = Router::new()
@@ -373,6 +418,13 @@ pub(crate) fn bearer(h: &HeaderMap) -> WebResult<&str> {
 }
 async fn upgrade(
     State(s): State<Arc<Relay>>,
+    #[cfg(feature = "fleet-core")] setup: Option<
+        axum::Extension<Arc<crate::fleet::setup_broker::SetupBroker>>,
+    >,
+    #[cfg(feature = "fleet-core")] data: Option<
+        axum::Extension<Arc<crate::fleet::route_control::RouteControl>>,
+    >,
+    #[cfg(feature = "fleet-core")] axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     h: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> WebResult<Response> {
@@ -383,10 +435,35 @@ async fn upgrade(
         .ok_or(ApiError(StatusCode::UNAUTHORIZED, "invalid_token"))?;
     let id = value_str(&row, "deviceId")?.to_owned();
     require(s.store.get("device", &id)?.is_some(), "invalid_token")?;
+    #[cfg(feature = "fleet-core")]
+    let token_hash = hash(token);
+    #[cfg(feature = "fleet-core")]
+    let setup_headers = !h.contains_key("origin")
+        && h.get_all("authorization").iter().count() == 1
+        && uri.query().is_none();
+    #[cfg(feature = "fleet-core")]
+    let setup = setup.map(|v| v.0);
     Ok(ws
         .max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |ws| socket(s, id, ws))
+        .on_upgrade(move |ws| {
+            #[cfg(feature = "fleet-core")]
+            {
+                socket(
+                    s,
+                    id,
+                    ws,
+                    setup,
+                    data.map(|v| v.0),
+                    token_hash,
+                    setup_headers,
+                )
+            }
+            #[cfg(not(feature = "fleet-core"))]
+            {
+                socket(s, id, ws)
+            }
+        })
         .into_response())
 }
 async fn send(ws: &mut WebSocket, v: Value) -> Result<()> {
@@ -397,7 +474,15 @@ async fn send(ws: &mut WebSocket, v: Value) -> Result<()> {
     .await??;
     Ok(())
 }
-async fn socket(s: Arc<Relay>, id: String, mut ws: WebSocket) {
+async fn socket(
+    s: Arc<Relay>,
+    id: String,
+    mut ws: WebSocket,
+    #[cfg(feature = "fleet-core")] setup: Option<Arc<crate::fleet::setup_broker::SetupBroker>>,
+    #[cfg(feature = "fleet-core")] data: Option<Arc<crate::fleet::route_control::RouteControl>>,
+    #[cfg(feature = "fleet-core")] token_hash: String,
+    #[cfg(feature = "fleet-core")] setup_headers: bool,
+) {
     let generation = random();
     let run=async {
         let msg=timeout(Duration::from_secs(15),ws.recv()).await?.context("no hello")??;
@@ -406,14 +491,70 @@ async fn socket(s: Arc<Relay>, id: String, mut ws: WebSocket) {
         let tools:Vec<ToolDefinition>=serde_json::from_value(hello["tools"].clone())?;
         ensure!(tools.len()<=256,"too many tools");let mut names=HashSet::new();
         for t in &tools{ensure!(!t.name.is_empty() && t.name.len()<=128 && names.insert(t.name.clone()) && t.input_schema.is_object(),"invalid tool definition");}
+        #[cfg(feature = "fleet-core")]
+        let setup_enabled = if let Some(cap) = hello.get("fleetSetupProtocol") {
+            if !(cap.as_u64() == Some(1) && setup_headers && setup.is_some()) {
+                // A stable public code, not raw errors/credentials/hello contents.
+                send(&mut ws,json!({"type":"error","code":"FLEET_SETUP_UNAVAILABLE","message":"Setup control is disabled or negotiation is invalid","fatal":true})).await?;
+                anyhow::bail!("native setup unavailable or invalid negotiation");
+            }
+            setup_control::device_valid(&s, &id, &token_hash)?;
+            crate::fleet::setup_broker::Peer::new(&id, &generation)?;
+            true
+        } else { false };
+        #[cfg(feature = "fleet-core")]
+        let data_enabled=if let Some(cap)=hello.get("fleetDataProtocol"){
+            if !(cap.as_u64()==Some(1) && setup_enabled && data.is_some()){
+                send(&mut ws,json!({"type":"error","code":"FLEET_DATA_UNAVAILABLE","message":"DATA routing disabled or invalid negotiation","fatal":true})).await?;
+                anyhow::bail!("DATA control unavailable");
+            }
+            true
+        }else{false};
         let(tx,mut rx)=mpsc::channel(32);
-        {let mut live=s.devices.lock().expect("devices lock");ensure!(live.len()<1024 || live.contains_key(&id),"device limit");if let Some(old)=live.insert(id.clone(),Connected{generation:generation.clone(),tools,tx}){let _=old.tx.try_send(Outbound::Close);}}
-        send(&mut ws,json!({"type":"welcome","protocol":1,"relayVersion":env!("CARGO_PKG_VERSION"),"serverTime":now()*1000})).await?;
+        {let mut live=s.devices.lock().expect("devices lock");ensure!(live.len()<1024 || live.contains_key(&id),"device limit");if let Some(old)=live.insert(id.clone(),Connected{generation:generation.clone(),tools,tx,
+            #[cfg(feature = "fleet-core")] token_hash:token_hash.clone(),
+            #[cfg(feature = "fleet-core")] setup_scope:setup.as_ref().filter(|_|setup_enabled).map(|b|b.scope()),
+            #[cfg(feature = "fleet-core")] route_scope:data.as_ref().filter(|_|data_enabled).map(|b|b.scope()),
+        }){let _=old.tx.try_send(Outbound::Close);}}
+        let welcome=json!({"type":"welcome","protocol":1,"relayVersion":env!("CARGO_PKG_VERSION"),"serverTime":now()*1000});
+        #[cfg(feature = "fleet-core")]
+        let welcome=if setup_enabled {let mut v=welcome;v["fleetSetupProtocol"]=json!(1);v}else{welcome};
+        #[cfg(feature = "fleet-core")]
+        let welcome=if data_enabled{let mut v=welcome;v["fleetDataProtocol"]=json!(1);v}else{welcome};
+        send(&mut ws,welcome).await?;
         let mut heartbeat=tokio::time::interval(Duration::from_secs(20));let mut seen=Instant::now();
         loop{
             tokio::select!{
-                _=heartbeat.tick()=>{ensure!(seen.elapsed()<Duration::from_secs(45),"stale agent");ensure!(s.store.get("device",&id)?.is_some(),"revoked");send(&mut ws,json!({"type":"ping","ts":now()*1000})).await?;},
-                msg=rx.recv()=>match msg{Some(Outbound::Frame(v))=>send(&mut ws,v).await?,_=>{let _=ws.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4401,reason:"device revoked or connection replaced".into()}))).await;break;}},
+                _=heartbeat.tick()=>{
+                    ensure!(seen.elapsed()<Duration::from_secs(45),"stale agent");
+                    ensure!(s.store.get("device",&id)?.is_some(),"revoked");
+                    #[cfg(feature = "fleet-core")]
+                    {
+                        if let Some(b)=setup.as_ref(){b.expire(std::time::Instant::now());}
+                        if setup_enabled{setup_control::device_valid(&s,&id,&token_hash)?;}
+                    }
+                    send(&mut ws,json!({"type":"ping","ts":now()*1000})).await?;
+                },
+                msg=rx.recv()=>match msg{
+                    Some(Outbound::Frame(v))=>send(&mut ws,v).await?,
+                    #[cfg(feature = "fleet-core")]
+                    Some(Outbound::Data(delivery))=>{
+                        let control=data.as_ref().context("DATA control unavailable")?;
+                        if route_control::may_deliver(&s,control,&delivery,&id,&generation).is_err(){control.failed(delivery.id());continue;}
+                        let result=send(&mut ws,delivery.frame()).await;
+                        if result.is_err(){control.failed(delivery.id());}
+                        result?;control.sent(&delivery);
+                    },
+                    #[cfg(feature = "fleet-core")]
+                    Some(Outbound::Setup(delivery))=>{
+                        let broker=setup.as_ref().context("native setup unavailable")?;
+                        if setup_control::may_deliver(&s,broker,&delivery,&id,&generation).is_err(){broker.failed(&delivery);continue;}
+                        let result=send(&mut ws,delivery.frame()).await;
+                        if result.is_err(){broker.failed(&delivery);}
+                        result?;broker.sent(&delivery);
+                    },
+                    _=>{let _=ws.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:4401,reason:"device revoked or connection replaced".into()}))).await;break;}
+                },
                 msg=ws.recv()=>{
                     let msg=msg.context("closed")??;
                     match msg{
@@ -421,6 +562,20 @@ async fn socket(s: Arc<Relay>, id: String, mut ws: WebSocket) {
                             let v:Value=serde_json::from_str(&text)?;
                             ensure!(s.devices.lock().expect("devices lock").get(&id).is_some_and(|d|d.generation==generation),"stale socket");
                             match v["type"].as_str(){
+                                #[cfg(feature = "fleet-core")]
+                                Some("fleetRoute")=>{
+                                    ensure!(data_enabled,"DATA routing not negotiated");
+                                    if route_control::forward(&s,data.as_ref().context("DATA control unavailable")?,&id,&generation,&text).is_err(){
+                                        data.as_ref().context("DATA control unavailable")?.disconnected(&crate::fleet::setup_broker::Peer::new(&id,&generation)?);
+                                        send(&mut ws,json!({"type":"error","code":"FLEET_DATA_REJECTED","message":"DATA routing declaration rejected; no retry in this approval","fatal":true})).await?;
+                                        anyhow::bail!("DATA declaration rejected");
+                                    }
+                                },
+                                #[cfg(feature = "fleet-core")]
+                                Some("fleetSetup")=>{
+                                    ensure!(setup_enabled,"native setup not negotiated");
+                                    setup_control::forward(&s,setup.as_ref().context("native setup unavailable")?,&id,&generation,&text)?;
+                                },
                                 Some("pong")=>{ensure!(v["ts"].is_u64(),"invalid pong");seen=Instant::now();},
                                 Some("result")=>{
                                     let call_id=v["id"].as_str().context("invalid result id")?;
@@ -450,6 +605,20 @@ async fn socket(s: Arc<Relay>, id: String, mut ws: WebSocket) {
         if live.get(&id).is_some_and(|d| d.generation == generation) {
             live.remove(&id);
         }
+    }
+    #[cfg(feature = "fleet-core")]
+    if let Some(broker) = setup.as_ref() {
+        broker.disconnected(&crate::fleet::setup_broker::Peer {
+            device: id.clone(),
+            generation: generation.clone(),
+        });
+    }
+    #[cfg(feature = "fleet-core")]
+    if let Some(control) = data.as_ref() {
+        control.disconnected(&crate::fleet::setup_broker::Peer {
+            device: id.clone(),
+            generation: generation.clone(),
+        });
     }
     let mut pending = s.pending.lock().expect("pending lock");
     pending.retain(|_, p| p.device != id || p.generation != generation);

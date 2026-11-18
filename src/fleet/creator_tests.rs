@@ -27,7 +27,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Runtime) {
 fn job(path: &Path, n: u8) -> JobSpec {
     let root = path.parent().unwrap();
     JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: Uuid::from_bytes([1; 16]),
         source_device: device_digest("source-A").unwrap(),
         target_device: device_digest("target-B").unwrap(),
@@ -38,6 +38,7 @@ fn job(path: &Path, n: u8) -> JobSpec {
         bytes_total: 3,
         sha256: Sha256::digest(b"abc").into(),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: format!("creator-{n}"),
@@ -142,6 +143,13 @@ fn replacement_at_original_path_rejected_then_original_database_restored() {
     c.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
     drop(c);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // VACUUM creates a new file with SQLite's default mode, not the source mode.
+        // Make this owned fixture admissible before testing database identity.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     assert_ne!(db_id(&path), id);
     let next = r
         .open_fleet_host(&path, InventoryLimits::default())
@@ -497,6 +505,12 @@ fn copied_database_rejects_proof_before_any_metadata_recovery() {
     c.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
         .unwrap();
     drop(c);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The copied database must pass file admission before recovery can be tested.
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let proof = h.stop_creators().unwrap();
     drop(h);
     let next = r

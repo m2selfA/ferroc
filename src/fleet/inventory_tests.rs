@@ -29,7 +29,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Policy) {
 }
 fn spec(root: &Path, n: u8, total: u64) -> JobSpec {
     JobSpec {
-        version: 1,
+        version: crate::fleet::job::JOB_VERSION,
         fleet_id: Uuid::from_bytes([1; 16]),
         source_device: device_digest("source-A").unwrap(),
         target_device: device_digest("target-B").unwrap(),
@@ -40,6 +40,7 @@ fn spec(root: &Path, n: u8, total: u64) -> JobSpec {
         bytes_total: total,
         sha256: Sha256::digest(b"abc").into(),
         overwrite: false,
+        pre_image_sha256: None,
         route: RoutePolicy::RelayOnly,
         deadline_ms: 5000,
         idempotency_key: format!("inventory-{n}"),

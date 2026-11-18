@@ -11,8 +11,12 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
 use uuid::Uuid;
+#[path = "source_resume_tests.rs"]
+mod cursor_tests;
 #[path = "source_window_tests.rs"]
 mod flow_tests;
+#[path = "source_prefix_tests.rs"]
+mod prefix_tests;
 struct Offer {
     g: ValidatedGrant,
     t: Transcript,
@@ -33,8 +37,17 @@ impl Offer {
         )
     }
     fn paths(data: &[u8], generation: u64, source_path: String, destination_path: String) -> Self {
+        Self::paths_with_chunk(data, generation, source_path, destination_path, 65536)
+    }
+    fn paths_with_chunk(
+        data: &[u8],
+        generation: u64,
+        source_path: String,
+        destination_path: String,
+        chunk_bytes: u32,
+    ) -> Self {
         let j = JobSpec {
-            version: 1,
+            version: crate::fleet::job::JOB_VERSION,
             fleet_id: Uuid::from_bytes([1; 16]),
             source_device: device_digest("source-A").unwrap(),
             target_device: device_digest("target-B").unwrap(),
@@ -45,6 +58,7 @@ impl Offer {
             bytes_total: data.len() as u64,
             sha256: Sha256::digest(data).into(),
             overwrite: false,
+            pre_image_sha256: None,
             route: RoutePolicy::RelayOnly,
             deadline_ms: 60100,
             idempotency_key: "source-ack-local".into(),
@@ -63,7 +77,7 @@ impl Offer {
             },
             job_digest: j.digest().unwrap(),
             permission: Permission::SendFileNoClobber,
-            chunk_bytes: 65536,
+            chunk_bytes,
             issued_at_ms: if generation == 0 { 100 } else { 201 },
             expires_at_ms: 50100 + generation,
         }

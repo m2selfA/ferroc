@@ -215,7 +215,8 @@ fn legacy_publication_cannot_manufacture_final_receipt_or_clear_stage_debt() {
             crate::fleet::stage::Publication::Published {
                 size: 3,
                 sha256: s.job().sha256,
-                parent_sync: crate::fleet::stage::ParentSync::Unsupported
+                parent_sync: crate::fleet::stage::ParentSync::Unsupported,
+                mode: crate::fleet::stage::PublishMode::CreateNoClobber,
             }
         )
         .is_err()
@@ -315,10 +316,15 @@ fn actual_process_exit_before_and_after_observation_sql_never_restores_live_owne
         assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
         h.recover_stopped_owner(s.owner()).unwrap();
         let e = h.resume().unwrap_err();
-        assert!(
-            format!("{e:#}").contains("unresolved inventory/debt"),
-            "{e:#}"
-        );
+        let text = format!("{e:#}");
+        assert!(text.contains("unresolved inventory/debt"), "{text}");
+        // The refusal must be actionable without opening the database by hand.
+        assert!(text.contains("reservedBytes="), "{text}");
+        assert!(text.contains("slots="), "{text}");
+        assert!(text.contains("findings="), "{text}");
+        assert!(text.contains("ferroc fleet-inventory"), "{text}");
+        // ...and must not leak a filesystem path.
+        assert!(!text.contains("ferroc-fleet-alloc"), "{text}");
         assert!(
             !h.inspect_allocation(&key)
                 .unwrap()

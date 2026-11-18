@@ -19,6 +19,31 @@ pub struct Ready {
     pub chunk_bytes: u32,
     pub window_chunks: u8,
 }
+/// Descriptive agreement on a BOTH-proof condition, never a File/lease capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResumeBase {
+    pub condition_digest: [u8; 32],
+    pub prefix_bytes: u64,
+    pub prefix_sha256: [u8; 32],
+}
+impl ResumeBase {
+    pub(super) fn from_condition(p: &super::resume_condition::ResumeProposal) -> Self {
+        Self {
+            condition_digest: p.digest(),
+            prefix_bytes: p.prefix_bytes(),
+            prefix_sha256: p.prefix_sha256(),
+        }
+    }
+}
+/// New authenticated kind, not a permissive extension of legacy READY.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResumeReady {
+    pub base: ResumeBase,
+    pub chunk_bytes: u32,
+    pub window_chunks: u8,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Ack {
@@ -58,6 +83,47 @@ pub enum CancelReason {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Cancel {
     pub reason: CancelReason,
+}
+/// Successor description in the renewal handshake. It names the NEXT binding,
+/// never the application payload, path, size or SHA, so a renewal frame cannot
+/// smuggle a different job in. Both sides already hold the successor grant from
+/// their own control plane; this only agrees WHICH one to install.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenewOffer {
+    pub next_authorization_id: Uuid,
+    pub next_key_epoch: Uuid,
+    pub generation: u64,
+}
+/// Target's half: it accepted the offer and names the offset both sides must be
+/// drained at. A mismatch with the source's own progress aborts the rotation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenewAccept {
+    pub next_authorization_id: Uuid,
+    pub next_key_epoch: Uuid,
+    pub generation: u64,
+    pub drained_at: u64,
+}
+/// Both sides are ready: this is the commit point of the handshake, still sealed
+/// under the OLD epoch. Installation happens after this frame, on both sides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenewCommit {
+    pub next_authorization_id: Uuid,
+    pub next_key_epoch: Uuid,
+    pub generation: u64,
+    pub drained_at: u64,
+}
+/// Target's confirmation that the relay adopted the successor and its own
+/// receiver is installed. Sealed under the NEW epoch, so it also proves the
+/// target can read the rotated session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenewCommitted {
+    pub next_authorization_id: Uuid,
+    pub next_key_epoch: Uuid,
+    pub generation: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,24 +167,34 @@ pub struct Status {
 pub enum ControlBody {
     Prepare(Empty),
     Ready(Ready),
+    ResumeReady(ResumeReady),
     Ack(Ack),
     Finish(Finish),
     CommitAck(Receipt),
     Cancel(Cancel),
     StatusRequest(Empty),
     Status(Status),
+    RenewOffer(RenewOffer),
+    RenewAccept(RenewAccept),
+    RenewCommit(RenewCommit),
+    RenewCommitted(RenewCommitted),
 }
 impl ControlBody {
     pub fn kind(&self) -> Kind {
         match self {
             Self::Prepare(_) => Kind::Prepare,
             Self::Ready(_) => Kind::Ready,
+            Self::ResumeReady(_) => Kind::ResumeReady,
             Self::Ack(_) => Kind::Ack,
             Self::Finish(_) => Kind::Finish,
             Self::CommitAck(_) => Kind::CommitAck,
             Self::Cancel(_) => Kind::Cancel,
             Self::StatusRequest(_) => Kind::StatusRequest,
             Self::Status(_) => Kind::Status,
+            Self::RenewOffer(_) => Kind::RenewOffer,
+            Self::RenewAccept(_) => Kind::RenewAccept,
+            Self::RenewCommit(_) => Kind::RenewCommit,
+            Self::RenewCommitted(_) => Kind::RenewCommitted,
         }
     }
     fn validate(&self, g: &ValidatedGrant) -> Result<()> {
@@ -136,11 +212,24 @@ impl ControlBody {
             check_digest(r.size, &r.sha256)
         };
         match self {
-            Self::Prepare(_) | Self::Cancel(_) | Self::StatusRequest(_) => {}
+            Self::Prepare(_)
+            | Self::Cancel(_)
+            | Self::StatusRequest(_)
+            | Self::RenewOffer(_)
+            | Self::RenewAccept(_)
+            | Self::RenewCommit(_)
+            | Self::RenewCommitted(_) => {}
             Self::Ready(r) => ensure!(
                 r.chunk_bytes == g.grant().chunk_bytes
                     && (1..=WINDOW as u8).contains(&r.window_chunks),
                 "READY does not match negotiated grant/window"
+            ),
+            Self::ResumeReady(r) => ensure!(
+                r.chunk_bytes == g.grant().chunk_bytes
+                    && (1..=WINDOW as u8).contains(&r.window_chunks)
+                    && r.base.prefix_bytes <= total
+                    && g.lease_profile() == super::job::LeaseProfile::SingleOwner,
+                "resume READY outside SingleOwner grant/window/base"
             ),
             Self::Ack(a) => {
                 ensure!(

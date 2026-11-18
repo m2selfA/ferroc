@@ -20,6 +20,8 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum ObjectState {
     Absent,
+    /// Anonymous owner/bytes cannot be located or released from a path observation.
+    AnonymousUnobservable,
     PresentBoundIdsMatch,
     PresentUnbound,
     PresentMismatch,
@@ -106,7 +108,8 @@ impl AbsenceRelease {
             .allocation()
             .context("release needs original allocation")?;
         ensure!(
-            !self.id.is_nil()
+            !a.is_anonymous()
+                && !self.id.is_nil()
                 && !self.by.is_nil()
                 && self.by != a.original_owner()
                 && a.database_id().is_some()
@@ -138,6 +141,9 @@ fn observe(
     let owner_recovered = s.owner() == fence.owner;
     let mut held = None;
     let state = (|| -> Result<ObjectState> {
+        if a.is_anonymous() {
+            return Ok(ObjectState::AnonymousUnobservable);
+        }
         local_path(r.path())?;
         let parent = r.path().parent().context("missing stage parent")?;
         local_path(parent)?;
@@ -187,6 +193,7 @@ fn observe(
     let eligible = database_matches
         && origin_stopped
         && owner_recovered
+        && !a.is_anonymous()
         && state == ObjectState::Absent
         && s.is_absence_candidate();
     let encoded = serde_json::to_vec(&(
